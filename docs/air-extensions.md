@@ -862,7 +862,8 @@ The live test only initializes the SDK. It sends no model prompt.
 
 Claude can run work in the background, for example a backgrounded Bash command or a workflow.
 The adapter publishes that work as async tasks when the client declares `asyncTasks`.
-Without the capability, the adapter sends no async task update.
+A client that does not use AIR opts in with `"async-tasks": true` in its client capabilities `_meta`; it receives the same updates and stop request, without any AIR key.
+Without either, the adapter sends no async task update.
 A subagent task (`local_agent`) is not an async task. Native subagent sessions report it.
 A task that a `Monitor` tool call started is not an async task either.
 Monitor streams its output to the model only, so the client gets nothing for it.
@@ -879,9 +880,10 @@ Its spawn, progress and state updates go there also after the subagent finished.
   `showInTranscript` is `false` when the SDK asks to skip the transcript.
 - `async_task_progress` carries only the changed fields: `description`, `summary`, `lastToolName`, `usage`, `outputFilePath`, and `toolCallId`.
 - `async_task_state_update` carries `state` (`running`, `paused`, `completed`, `failed`, or `stopped`) and an optional `summary`.
-- The Bash `tool_call_update` of a backgrounded command carries `_meta.jetbrains.air.asyncTasks.backgrounded: true`.
+- For an AIR client, the Bash `tool_call_update` of a backgrounded command carries `_meta.jetbrains.air.asyncTasks.backgrounded: true`.
   The card then shows backgrounded work instead of finished work.
   Only structured data sets the marker: the `backgroundTaskId` of the tool result, a known background task of the tool call, or a `run_in_background` input.
+  A client without AIR finds the card of a task through the `toolCallId` of its spawn.
 
 ### Task id and output path
 
