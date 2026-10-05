@@ -109,12 +109,20 @@ import type {
   BetaWebFetchToolResultBlockParam,
   BetaCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
+import { validateRecorded } from "./acp-scenarios/schema.js";
 
 /** The capabilities of an AIR client. Only AIR gets the AIR extensions of
  *  `docs/air-extensions.md`. */
 const AIR_CLIENT_CAPABILITIES = {
   _meta: { jetbrains: { air: { version: 1, capabilities: [] as string[] } } },
 };
+
+/** AIR with native subagent sessions. AIR gets the earlier draft of the
+ *  subagents RFD (`subagent_spawned`, `subagent_state_update`, a session per
+ *  generation), which the tests that use this pin. */
+const AIR_NATIVE_SUBAGENTS = {
+  _meta: { jetbrains: { air: { version: 1, capabilities: ["nativeSubagentSessions"] } } },
+} as ClientCapabilities;
 
 /** A `system`/init frame advertising the msg_lifecycle_v1 capability, so the
  *  consumer latches `session.msgLifecycleV1` and cancel() routes orphan
@@ -3310,7 +3318,7 @@ describe("subagent transcript replay", () => {
     await initializeClient(
       agent,
       capability === "native"
-        ? ({ subagents: {} } as ClientCapabilities)
+        ? AIR_NATIVE_SUBAGENTS
         : capability === "legacy"
           ? { _meta: { "subagent-transcript": true } }
           : {},
@@ -3446,7 +3454,7 @@ describe("subagent transcript replay", () => {
         } as unknown as AcpClient,
         { log: () => {}, error: () => {} },
       );
-      await initializeClient(agent, { subagents: {} } as ClientCapabilities);
+      await initializeClient(agent, AIR_NATIVE_SUBAGENTS);
       vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
       vi.mocked(getSubagentMessages).mockClear();
       await (
@@ -5324,6 +5332,54 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(requests[0].sessionId).toBe("child-session");
   });
 
+  it("reports a child as requires_action while its permission request is open (the subagents RFD)", async () => {
+    const { agent, updates, requests, session } = setup();
+    await initializeClient(agent, { subagents: {} } as ClientCapabilities);
+    session.liveBackgroundTasks.set("agent-42", {
+      parentToolUseId: "toolu_parent",
+      isSubagent: true,
+    });
+    session.nativeSubagentsByTaskId = new Map([
+      [
+        "agent-42",
+        {
+          sessionId: "agent-42",
+          parentSessionId: "session-1",
+          parentToolUseId: "toolu_parent",
+          name: "Explore",
+          task: "Investigate",
+          announced: true,
+          workState: "running",
+        },
+      ],
+    ]);
+    session.nativeSubagentRuntime = new NativeSubagentRuntime(
+      "rfd",
+      "session-1",
+      session,
+      async (notification) => {
+        updates.push(notification as SessionNotification);
+      },
+      { log: () => {} },
+    );
+
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_sub",
+      agentID: "agent-42",
+    } as any);
+
+    const states = updates.flatMap(({ sessionId, update }) =>
+      update.sessionUpdate === "subagent_update" ? [[sessionId, update.state]] : [],
+    );
+    expect(states).toEqual([
+      ["session-1", { state: "requires_action" }],
+      ["session-1", { state: "running" }],
+    ]);
+    expect(requests[0].sessionId).toBe("agent-42");
+  });
+
   it("keeps a raced permission on the root until the child is announced", async () => {
     const { agent, updates, requests, session } = setup();
     await agent.initialize({
@@ -5722,9 +5778,7 @@ describe("subagent permission attribution (issue #851)", () => {
     );
     await agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: { subagents: {} } as ClientCapabilities & {
-        subagents: Record<string, never>;
-      },
+      clientCapabilities: AIR_NATIVE_SUBAGENTS,
     });
     injectGeneratorSession(
       agent,
@@ -5768,6 +5822,128 @@ describe("subagent permission attribution (issue #851)", () => {
     );
   });
 
+  describe("the subagents RFD, for a client that declares subagents and is not AIR", () => {
+    // Each task_started names a subagent type: a task without one is not a subagent.
+    /** The updates of `frames`, for a client that declares `subagents`. */
+    async function run(frames: unknown[]): Promise<AcpSessionNotification[]> {
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: AcpSessionNotification) => {
+            updates.push(update);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities,
+      });
+      injectGeneratorSession(agent, makeGenerator([...frames, successResult()] as never));
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      // Every update is a valid v1 session update, without an extension.
+      for (const payload of updates) {
+        expect(validateRecorded({ kind: "sessionUpdate", payload }, new Set())).toEqual([]);
+      }
+      return updates;
+    }
+    const subagentTraffic = (updates: AcpSessionNotification[]) =>
+      updates.filter(({ update }) =>
+        [
+          "subagent_update",
+          "session_message",
+          "subagent_spawned",
+          "subagent_state_update",
+        ].includes(update.sessionUpdate),
+      );
+    const taskUpdated = (patch: Record<string, unknown>) => ({
+      type: "system",
+      subtype: "task_updated",
+      task_id: "agent-42",
+      patch,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+
+    it("announces the child as running, then sends it the prompt as a message", async () => {
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore", prompt: "Go" },
+        taskUpdated({ status: "completed" }),
+      ]);
+
+      expect(subagentTraffic(updates)).toEqual([
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            title: "Explore",
+            description: "Investigate",
+            state: { state: "running" },
+          },
+        },
+        {
+          sessionId: "agent-42",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "toolu_parent",
+            senderSessionId: "test-session",
+            recipientSessionId: "agent-42",
+            content: [{ type: "text", text: "Go" }],
+          },
+        },
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            state: { state: "idle", stopReason: "end_turn" },
+          },
+        },
+      ]);
+    });
+
+    it("reports a failed child as idle, with the SDK's error", async () => {
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        taskUpdated({ status: "failed", error: "Context too small" }),
+      ]);
+
+      expect(subagentTraffic(updates).at(-1)?.update).toEqual({
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-42",
+        state: {
+          state: "idle",
+          _meta: { claudeCode: { error: { code: -32603, message: "Context too small" } } },
+        },
+      });
+    });
+
+    it("reports a child that the SDK stopped as cancelled", async () => {
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        taskUpdated({ status: "killed" }),
+      ]);
+
+      expect(subagentTraffic(updates).at(-1)?.update).toMatchObject({
+        state: { state: "idle", stopReason: "cancelled" },
+      });
+    });
+
+    it("sends no update of the earlier draft that AIR implements", async () => {
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        taskUpdated({ status: "completed" }),
+      ]);
+
+      expect(
+        updates.filter(({ update }) =>
+          ["subagent_spawned", "subagent_state_update"].includes(update.sessionUpdate),
+        ),
+      ).toEqual([]);
+    });
+  });
+
   it("buffers child output until spawn and drops duplicates and late updates", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -5780,9 +5956,7 @@ describe("subagent permission attribution (issue #851)", () => {
     );
     await agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: { subagents: {} } as ClientCapabilities & {
-        subagents: Record<string, never>;
-      },
+      clientCapabilities: AIR_NATIVE_SUBAGENTS,
     });
     const childMessage = (text: string) => ({
       type: "stream_event" as const,
@@ -5902,9 +6076,7 @@ describe("subagent permission attribution (issue #851)", () => {
       );
       await agent.initialize({
         protocolVersion: 1,
-        clientCapabilities: { subagents: {} } as ClientCapabilities & {
-          subagents: Record<string, never>;
-        },
+        clientCapabilities: AIR_NATIVE_SUBAGENTS,
       });
       injectGeneratorSession(
         agent,
@@ -5977,9 +6149,7 @@ describe("subagent permission attribution (issue #851)", () => {
     );
     await agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: { subagents: {} } as ClientCapabilities & {
-        subagents: Record<string, never>;
-      },
+      clientCapabilities: AIR_NATIVE_SUBAGENTS,
     });
     const agentTool = (id: string, parent_tool_use_id: string | null) => ({
       type: "assistant" as const,
@@ -6076,9 +6246,7 @@ describe("subagent permission attribution (issue #851)", () => {
     );
     await agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: { subagents: {} } as ClientCapabilities & {
-        subagents: Record<string, never>;
-      },
+      clientCapabilities: AIR_NATIVE_SUBAGENTS,
     });
     injectGeneratorSession(
       agent,
@@ -6110,9 +6278,7 @@ describe("subagent permission attribution (issue #851)", () => {
     );
     await agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: { subagents: {} } as ClientCapabilities & {
-        subagents: Record<string, never>;
-      },
+      clientCapabilities: AIR_NATIVE_SUBAGENTS,
     });
     injectGeneratorSession(
       agent,
@@ -6152,9 +6318,7 @@ describe("subagent permission attribution (issue #851)", () => {
     );
     await agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: { subagents: {} } as ClientCapabilities & {
-        subagents: Record<string, never>;
-      },
+      clientCapabilities: AIR_NATIVE_SUBAGENTS,
     });
     let childStarted!: () => void;
     const started = new Promise<void>((resolve) => (childStarted = resolve));
@@ -6821,7 +6985,7 @@ describe("native subagent eager tool ownership", () => {
       nativeSubagentParentByToolUseId: new Map(),
     };
     const runtime = new NativeSubagentRuntime(
-      true,
+      "air",
       "root",
       session,
       async (notification) => {
@@ -6881,7 +7045,7 @@ describe("native subagent eager tool ownership", () => {
       nativeSubagentTaskIdByToolUseId: new Map([["toolu_agent", "agent-1"]]),
       nativeSubagentParentByToolUseId: new Map(),
     };
-    const runtime = new NativeSubagentRuntime(true, "root", session, async () => {}, {
+    const runtime = new NativeSubagentRuntime("air", "root", session, async () => {}, {
       log: () => {},
     });
     const terminal = {
@@ -9975,22 +10139,19 @@ describe("logout", () => {
     expect(response.agentCapabilities?.auth?.logout).toEqual({});
   });
 
-  it("advertises the agent subagent capability independently of client negotiation", async () => {
+  it("advertises the agent subagent capability of AIR's draft to AIR alone", async () => {
     const agent = createMockAgent();
-    const unsupported = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
-    const supported = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: { subagents: {} } as ClientCapabilities & {
-        subagents: Record<string, never>;
-      },
-    });
+    const advertised = async (clientCapabilities: ClientCapabilities) =>
+      (
+        (await agent.initialize({ protocolVersion: 1, clientCapabilities })).agentCapabilities
+          ?.sessionCapabilities as { subagents?: unknown }
+      ).subagents;
 
-    expect(
-      (unsupported.agentCapabilities?.sessionCapabilities as { subagents?: unknown }).subagents,
-    ).toEqual({});
-    expect(
-      (supported.agentCapabilities?.sessionCapabilities as { subagents?: unknown }).subagents,
-    ).toEqual({});
+    // The subagents RFD has only the client capability.
+    expect(await advertised({})).toBeUndefined();
+    expect(await advertised({ subagents: {} } as ClientCapabilities)).toBeUndefined();
+    expect(await advertised(AIR_CLIENT_CAPABILITIES)).toEqual({});
+    expect(await advertised(AIR_NATIVE_SUBAGENTS)).toEqual({});
   });
 
   it("negotiates subagents through AIR metadata when the SDK strips the draft field", async () => {
@@ -17223,9 +17384,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         if (options.subagents) {
           await agent.initialize({
             protocolVersion: 1,
-            clientCapabilities: { subagents: {} } as ClientCapabilities & {
-              subagents: Record<string, never>;
-            },
+            clientCapabilities: AIR_NATIVE_SUBAGENTS,
           });
         }
         const first = await agent.prompt({

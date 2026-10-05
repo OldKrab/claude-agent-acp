@@ -1,5 +1,11 @@
-import type { AcpSessionNotification, SubagentState } from "./acp-subagents.js";
+import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
+
+/** The work state of a child, as the RFD's `subagent_update.state` carries it. */
+type WorkState = NonNullable<
+  Extract<SessionNotification["update"], { sessionUpdate: "subagent_update" }>["state"]
+>;
 
 export type NativeSubagent = {
   sessionId: string;
@@ -9,9 +15,23 @@ export type NativeSubagent = {
   task: string;
   /**
    * The exact prompt of this generation, sent as `prompt` in
-   * `subagent_spawned`. It is absent when the adapter has no prompt.
+   * `subagent_spawned`, or as the child's first `session_message` in the RFD
+   * form. It is absent when the adapter has no prompt.
    */
   prompt?: string;
+  /** The RFD form: the parent's label for the child, `subagent_update.title`. */
+  title?: string;
+  /** The RFD form: the child's purpose, `subagent_update.description`. */
+  description?: string;
+  /**
+   * The RFD form: the work state the client holds. The child is reusable, so
+   * `idle` is not terminal. AIR's draft uses {@link terminalState} instead.
+   */
+  workState?: WorkState["state"];
+  /** The RFD form: the open permission and question requests of the child. */
+  openRequests?: number;
+  /** The RFD form: the number of prompts the child got, for their message ids. */
+  prompts?: number;
   announced?: boolean;
   terminalState?: SubagentState;
   /** Connection-local single-flight state; never serialized on the wire. */
@@ -56,6 +76,8 @@ const MAX_CHILD_TOOL_CALLS = 2048;
  */
 export class NativeSubagentRuntime {
   readonly enabled: boolean;
+  /** The form of the child sessions; see {@link SubagentForm}. */
+  readonly form: SubagentForm | undefined;
 
   private readonly children: Map<string, NativeSubagent>;
   private readonly taskByToolUse: Map<string, string>;
@@ -74,14 +96,16 @@ export class NativeSubagentRuntime {
   private readonly pending = new Map<string, AcpSessionNotification[]>();
   private pendingCount = 0;
 
+  /** `form` is undefined for a client without native subagent sessions. */
   constructor(
-    enabled: boolean,
+    form: SubagentForm | undefined,
     private readonly rootSessionId: string,
     private readonly session: NativeSubagentSession,
     private readonly publish: Publish,
     private readonly logger: Logger,
   ) {
-    this.enabled = enabled;
+    this.form = form;
+    this.enabled = form !== undefined;
     this.children = session.nativeSubagentsByTaskId ??= new Map();
     this.taskByToolUse = session.nativeSubagentTaskIdByToolUseId ??= new Map();
     this.parentByToolUse = session.nativeSubagentParentByToolUseId ??= new Map();
@@ -125,19 +149,27 @@ export class NativeSubagentRuntime {
       if (child && !child.announced) {
         child.parentSessionId = parentSessionId ?? this.rootSessionId;
         applySubagentIdentity(child, this.identityByToolUse.get(toolCallId));
-        await announceNativeSubagent(child, this.publish);
+        await announceNativeSubagent(child, this.publish, this.form);
         for (const pending of this.takePending(toolCallId)) await deliver(pending);
       }
-      if (!child && isFailedToolCallUpdate(update)) {
-        this.takePending(toolCallId);
-        const initial = this.controlByToolUse.get(toolCallId);
-        this.cleanupControl(toolCallId);
-        if (forcedSessionId) {
-          return { ...notification, sessionId: forcedSessionId };
+      if (this.form === "air") {
+        if (!child && isFailedToolCallUpdate(update)) {
+          this.takePending(toolCallId);
+          const initial = this.controlByToolUse.get(toolCallId);
+          this.cleanupControl(toolCallId);
+          if (forcedSessionId) {
+            return { ...notification, sessionId: forcedSessionId };
+          }
+          return failedControlFallback(
+            initial,
+            notification,
+            parentSessionId ?? this.rootSessionId,
+          );
         }
-        return failedControlFallback(initial, notification, parentSessionId ?? this.rootSessionId);
+        return forcedSessionId ? { ...notification, sessionId: forcedSessionId } : null;
       }
-      return forcedSessionId ? { ...notification, sessionId: forcedSessionId } : null;
+      // The RFD form: the Agent/Task tool call is the parent's record of the
+      // delegation, so it stays a tool call of the session that made it.
     }
 
     const toolCallId =
@@ -180,6 +212,11 @@ export class NativeSubagentRuntime {
       return;
     }
     const previous = this.children.get(task.taskId);
+    if (previous && this.form === "rfd") {
+      // A child keeps its session for every delegation to it.
+      await this.resumeChild(previous, promptText(task.prompt), task.toolUseId ?? undefined);
+      return;
+    }
     if (previous && previous.terminalState === undefined) return;
 
     // A SendMessage resume reuses the finished generation's tool id, whose
@@ -207,6 +244,11 @@ export class NativeSubagentRuntime {
           identity?.description ?? task.description,
         ),
         ...promptField(promptText(task.prompt) ?? identity?.prompt),
+        ...rfdLabels(
+          identity?.name,
+          identity?.subagentType ?? task.subagentType,
+          identity?.description ?? task.description,
+        ),
       },
       !!knownParentSessionId || !task.toolUseId,
       deliver,
@@ -220,12 +262,21 @@ export class NativeSubagentRuntime {
    * signal. A child that did not finish is not changed. The `prompt` is the
    * SendMessage text that resumed the child, when the adapter knows it.
    */
-  async taskResumed(taskId: string, deliver: Publish, prompt?: string): Promise<void> {
+  async taskResumed(
+    taskId: string,
+    deliver: Publish,
+    prompt?: string,
+    promptMessageId?: string,
+  ): Promise<void> {
     if (!this.enabled) return;
     const previous = this.children.get(taskId);
     if (!previous) return;
     const finishing = this.taskFinishPromises.get(taskId) ?? previous.terminalPromise;
     if (finishing) await finishing.catch(() => {});
+    if (this.form === "rfd") {
+      await this.resumeChild(previous, promptText(prompt), promptMessageId);
+      return;
+    }
     if (this.children.get(taskId) !== previous || previous.terminalState === undefined) return;
     await this.openGeneration(
       taskId,
@@ -242,27 +293,39 @@ export class NativeSubagentRuntime {
     );
   }
 
+  /**
+   * Reports that the SDK ended the task's work. `error` is the SDK's text for
+   * a failure, when it gives one.
+   */
   async finishTask(
     taskId: string,
     status: unknown,
     deliver: Publish,
     toolUseId?: string | null,
+    error?: string,
   ): Promise<void> {
     if (!this.enabled) return;
     const state = nativeSubagentState(status);
     const child = toolUseId ? this.childByParentToolUse.get(toolUseId) : this.children.get(taskId);
     if (child && toolUseId && this.taskByToolUse.get(toolUseId) !== taskId) return;
-    if (!state || !child || child.terminalState !== undefined) return;
+    if (!state || !child) return;
+    if (this.form === "air" ? child.terminalState !== undefined : child.workState === "idle") {
+      return;
+    }
     const existing = this.taskFinishPromises.get(taskId);
     if (existing) return existing;
 
     const finish = Promise.resolve().then(async () => {
       try {
-        await announceNativeSubagent(child, this.publish);
+        await announceNativeSubagent(child, this.publish, this.form);
         if (child.parentToolUseId) {
           for (const pending of this.takePending(child.parentToolUseId)) await deliver(pending);
         }
-        await finishNativeSubagent(this.session, taskId, state, this.publish);
+        if (this.form === "rfd") {
+          await this.reportState(child, rfdEndState(state, error));
+        } else {
+          await finishNativeSubagent(this.session, taskId, state, this.publish);
+        }
       } finally {
         if (child.parentToolUseId) {
           this.cleanupControl(child.parentToolUseId);
@@ -298,8 +361,67 @@ export class NativeSubagentRuntime {
     if (errors.length > 1) throw new AggregateError(errors, "Failed to finish native subagents");
   }
 
+  /**
+   * The parent session got `session/cancel`. AIR's draft ends every child as
+   * cancelled here. The RFD form reports nothing: acknowledging a cancel is no
+   * evidence that a child stopped, and a background subagent outlives the
+   * interrupt. The SDK's task events, or the end of the stream, end it.
+   */
+  async parentCancelled(deliver: Publish): Promise<void> {
+    if (this.form === "air") await this.finishAll("cancelled", deliver);
+  }
+
+  /**
+   * Runs `request`, a permission or question request of the session
+   * `sessionId`. In the RFD form, a child waiting on it is `requires_action`
+   * until its last open request ends.
+   */
+  async awaitingUser<T>(sessionId: string, request: () => Promise<T>): Promise<T> {
+    const child = this.form === "rfd" ? this.childOfSession(sessionId) : undefined;
+    if (!child?.announced) return request();
+    child.openRequests = (child.openRequests ?? 0) + 1;
+    if (child.openRequests === 1 && child.workState === "running") {
+      await this.reportState(child, { state: "requires_action" }).catch((error) =>
+        this.logger.log(`Failed to report that subagent ${child.sessionId} waits: ${error}`),
+      );
+    }
+    try {
+      return await request();
+    } finally {
+      child.openRequests = (child.openRequests ?? 1) - 1;
+      if (child.openRequests === 0 && child.workState === "requires_action") {
+        await this.reportState(child, { state: "running" }).catch((error) =>
+          this.logger.log(`Failed to report that subagent ${child.sessionId} runs: ${error}`),
+        );
+      }
+    }
+  }
+
   discardPending(parentToolUseId: string): void {
     this.takePending(parentToolUseId);
+  }
+
+  /**
+   * The RFD form: the parent delegates to a child again, which keeps its
+   * session. A child that is still working is not changed.
+   */
+  private async resumeChild(
+    child: NativeSubagent,
+    prompt: string | undefined,
+    promptMessageId: string | undefined,
+  ): Promise<void> {
+    if (!child.announced || isWorking(child)) return;
+    await this.reportState(child, { state: "running" });
+    if (prompt) await publishPrompt(child, prompt, promptMessageId, this.publish);
+  }
+
+  /** The RFD form: publishes the work state of `child` on its parent. */
+  private async reportState(child: NativeSubagent, state: WorkState): Promise<void> {
+    child.workState = state.state;
+    await this.publish({
+      sessionId: child.parentSessionId,
+      update: { sessionUpdate: "subagent_update", sessionId: child.sessionId, state },
+    });
   }
 
   /**
@@ -311,7 +433,9 @@ export class NativeSubagentRuntime {
     notification: AcpSessionNotification,
     toolCallId: string | undefined,
   ): AcpSessionNotification | null {
-    if (child.terminalState !== undefined || child.terminalPromise) {
+    // AIR's draft ends a child for good. In the RFD form an idle child is
+    // reusable, and its background work can still report.
+    if (this.form === "air" && (child.terminalState !== undefined || child.terminalPromise)) {
       this.logger.log(
         `Session ${this.rootSessionId}: ignoring late update for terminal subagent ${child.sessionId}`,
       );
@@ -429,7 +553,7 @@ export class NativeSubagentRuntime {
     previous: NativeSubagent | undefined,
     fields: Pick<
       NativeSubagent,
-      "parentSessionId" | "parentToolUseId" | "name" | "task" | "prompt"
+      "parentSessionId" | "parentToolUseId" | "name" | "task" | "prompt" | "title" | "description"
     >,
     announce: boolean,
     deliver: Publish,
@@ -446,7 +570,7 @@ export class NativeSubagentRuntime {
       this.controlByToolUse.delete(toolUseId);
     }
     if (!announce) return;
-    await announceNativeSubagent(child, this.publish);
+    await announceNativeSubagent(child, this.publish, this.form);
     for (const pending of toolUseId ? this.takePending(toolUseId) : []) await deliver(pending);
   }
 
@@ -461,13 +585,36 @@ export class NativeSubagentRuntime {
   }
 }
 
+/**
+ * Announces the child on its parent, once, before any update of the child.
+ * The RFD form announces it as running and then sends the prompt as the
+ * first message of the child. The child gets no capabilities, so the client
+ * may not cancel or otherwise change it.
+ */
 export async function announceNativeSubagent(
   child: NativeSubagent,
   publish: Publish,
+  form: SubagentForm = "air",
 ): Promise<void> {
   if (child.announced) return;
   if (child.announcePromise) return child.announcePromise;
   const announce = Promise.resolve().then(async () => {
+    if (form === "rfd") {
+      child.workState = "running";
+      await publish({
+        sessionId: child.parentSessionId,
+        update: {
+          sessionUpdate: "subagent_update",
+          sessionId: child.sessionId,
+          ...(child.title ? { title: child.title } : {}),
+          ...(child.description ? { description: child.description } : {}),
+          state: { state: "running" },
+        },
+      });
+      child.announced = true;
+      if (child.prompt) await publishPrompt(child, child.prompt, child.parentToolUseId, publish);
+      return;
+    }
     await publish({
       sessionId: child.parentSessionId,
       update: {
@@ -519,6 +666,80 @@ export async function finishNativeSubagent(
 }
 
 /**
+ * The RFD form: the parent's message to the child, in the child's transcript
+ * (its incoming view). Its id is the id of the tool use that sent it, the
+ * Agent/Task call or a SendMessage, which is unique in the child's transcript.
+ */
+async function publishPrompt(
+  child: NativeSubagent,
+  prompt: string,
+  toolUseId: string | undefined,
+  publish: Publish,
+): Promise<void> {
+  child.prompts = (child.prompts ?? 0) + 1;
+  await publish({
+    sessionId: child.sessionId,
+    update: {
+      sessionUpdate: "session_message",
+      messageId: toolUseId ?? `${child.sessionId}:prompt:${child.prompts}`,
+      senderSessionId: child.parentSessionId,
+      recipientSessionId: child.sessionId,
+      content: [{ type: "text", text: prompt }],
+    },
+  });
+}
+
+/** The RFD form: whether the child's foreground work is in progress. */
+function isWorking(child: NativeSubagent): boolean {
+  return child.workState === "running" || child.workState === "requires_action";
+}
+
+/**
+ * The RFD form: the work state at the end of a child's work.
+ *
+ * A failure has no stop reason yet: the RFD's `error` stop reason, with its
+ * JSON-RPC `error`, is newer than SDK 1.7.0's v1 schema, whose `StopReason`
+ * is closed. Until the SDK has it, the failure goes in
+ * `_meta.claudeCode.error`, as the v2 surface does for a failed turn.
+ */
+function rfdEndState(state: SubagentState, error: string | undefined): WorkState {
+  switch (state) {
+    case "completed":
+      return { state: "idle", stopReason: "end_turn" };
+    case "cancelled":
+      return { state: "idle", stopReason: "cancelled" };
+    case "failed":
+      return {
+        state: "idle",
+        ...(error ? { _meta: { claudeCode: { error: { code: -32603, message: error } } } } : {}),
+      };
+    default:
+      // "disconnected": the child can no longer be observed.
+      return { state: "unknown" };
+  }
+}
+
+/**
+ * The RFD form: the parent's labels for a child. The title is the agent's
+ * name, with its role after it when both are known, else the role. The
+ * description is the task's short description, never the prompt.
+ */
+function rfdLabels(
+  name: unknown,
+  role: unknown,
+  description: unknown,
+): { title?: string; description?: string } {
+  const agentName = nonBlankString(name);
+  const agentRole = nonBlankString(role);
+  const title =
+    agentName && agentRole && agentName !== agentRole
+      ? `${agentName} (${agentRole})`
+      : (agentName ?? agentRole);
+  const text = nonBlankString(description);
+  return { ...(title ? { title } : {}), ...(text ? { description: text } : {}) };
+}
+
+/**
  * The agent id that a successful SendMessage result resumed. The SDK puts it
  * in `tool_use_result.resumedAgentId` when a finished agent runs again.
  */
@@ -538,17 +759,28 @@ export function sendMessageResumePrompt(
   agentId: string,
   resultToolUseIds: readonly string[] = [],
 ): string | undefined {
+  return sendMessageResume(toolUses, agentId, resultToolUseIds)?.text;
+}
+
+/** The SendMessage call that resumed the agent `agentId`, and its text; see {@link sendMessageResumePrompt}. */
+export function sendMessageResume(
+  toolUses: Record<string, { name: string; input: unknown } | undefined>,
+  agentId: string,
+  resultToolUseIds: readonly string[] = [],
+): { toolUseId: string; text: string } | undefined {
   for (const toolUseId of resultToolUseIds) {
     const toolUse = toolUses[toolUseId];
     if (toolUse?.name !== "SendMessage") continue;
     const text = promptText((toolUse.input as { message?: unknown } | null)?.message);
-    if (text) return text;
+    if (text) return { toolUseId, text };
   }
   if (resultToolUseIds.length > 0) return undefined;
-  for (const toolUse of Object.values(toolUses).reverse()) {
+  for (const [toolUseId, toolUse] of Object.entries(toolUses).reverse()) {
     if (toolUse?.name !== "SendMessage") continue;
     const input = toolUse.input as { to?: unknown; message?: unknown } | null;
-    if (input?.to === agentId) return promptText(input.message);
+    if (input?.to !== agentId) continue;
+    const text = promptText(input.message);
+    return text ? { toolUseId, text } : undefined;
   }
   return undefined;
 }
@@ -723,6 +955,9 @@ function applySubagentIdentity(
     child.task = subagentDescription(identity.prompt, identity.description);
   }
   child.prompt ??= identity.prompt;
+  const labels = rfdLabels(identity.name, identity.subagentType, identity.description);
+  child.title = labels.title ?? child.title;
+  child.description = labels.description ?? child.description;
 }
 
 /** The prompt text unchanged, or `undefined` when it is not a non-blank string. */

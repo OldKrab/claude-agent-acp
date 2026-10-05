@@ -107,6 +107,7 @@ import {
   asSdkSessionNotification,
   clientSupportsSubagents,
   SubagentAwareSessionCapabilities,
+  subagentForm,
   type SubagentState,
 } from "./acp-subagents.js";
 import {
@@ -116,7 +117,7 @@ import {
   NativeSubagentRuntime,
   nativeSubagentState,
   resumedNativeSubagentId,
-  sendMessageResumePrompt,
+  sendMessageResume,
 } from "./native-subagents.js";
 import {
   AIR_ASYNC_TASKS_CAPABILITY,
@@ -2657,6 +2658,8 @@ export class ClaudeAcpAgent {
       }
     }
 
+    // The subagents RFD has only the client capability. AIR's draft also had
+    // this agent capability, which AIR gets (`docs/air-extensions.md`).
     const sessionCapabilities: SubagentAwareSessionCapabilities = {
       additionalDirectories: {},
       close: {},
@@ -2664,7 +2667,7 @@ export class ClaudeAcpAgent {
       fork: {},
       list: {},
       resume: {},
-      subagents: {},
+      ...(this.toolCallCapabilities.air.client ? { subagents: {} } : {}),
     };
 
     return {
@@ -3906,7 +3909,7 @@ export class ClaudeAcpAgent {
      *  stamps from `parent_tool_use_id`, and never reach the top-level feed
      *  as the turn's answer. */
     const subagents = (session.nativeSubagentRuntime ??= new NativeSubagentRuntime(
-      clientSupportsSubagents(this.clientCapabilities),
+      subagentForm(this.clientCapabilities),
       params.sessionId,
       session,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
@@ -5515,7 +5518,13 @@ export class ClaudeAcpAgent {
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
-                  await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);
+                  await subagents.finishTask(
+                    message.task_id,
+                    message.patch.status,
+                    sendUpdate,
+                    undefined,
+                    message.patch.status === "failed" ? message.patch.error : undefined,
+                  );
                   const parentToolUseId = session.liveBackgroundTasks.get(
                     message.task_id,
                   )?.parentToolUseId;
@@ -5528,10 +5537,12 @@ export class ClaudeAcpAgent {
                   // The SDK can resume a finished subagent under the same
                   // agent id without a new task_started.
                   resumeLiveTask(message.task_id);
+                  const resume = sendMessageResume(session.toolUseCache, message.task_id);
                   await subagents.taskResumed(
                     message.task_id,
                     sendUpdate,
-                    sendMessageResumePrompt(session.toolUseCache, message.task_id),
+                    resume?.text,
+                    resume?.toolUseId,
                   );
                 }
                 break;
@@ -6856,18 +6867,20 @@ export class ClaudeAcpAgent {
               const resumedAgentId = resumedNativeSubagentId(message.tool_use_result);
               if (resumedAgentId) {
                 resumeLiveTask(resumedAgentId);
+                const resume = sendMessageResume(
+                  session.toolUseCache,
+                  resumedAgentId,
+                  Array.isArray(content)
+                    ? content.flatMap((block) =>
+                        block.type === "tool_result" ? [block.tool_use_id] : [],
+                      )
+                    : [],
+                );
                 await subagents.taskResumed(
                   resumedAgentId,
                   sendUpdate,
-                  sendMessageResumePrompt(
-                    session.toolUseCache,
-                    resumedAgentId,
-                    Array.isArray(content)
-                      ? content.flatMap((block) =>
-                          block.type === "tool_result" ? [block.tool_use_id] : [],
-                        )
-                      : [],
-                  ),
+                  resume?.text,
+                  resume?.toolUseId,
                 );
               }
             }
@@ -7170,8 +7183,7 @@ export class ClaudeAcpAgent {
     // resolves, not just the active-turn idle/backstop paths.
     await session.contextCompaction?.interrupt();
     try {
-      await session.nativeSubagentRuntime?.finishAll(
-        "cancelled",
+      await session.nativeSubagentRuntime?.parentCancelled(
         session.nativeSubagentDeliver ??
           (async (notification) =>
             this.client.sessionUpdate(asSdkSessionNotification(notification))),
@@ -7711,7 +7723,10 @@ export class ClaudeAcpAgent {
           })
         : undefined;
     let replayTurnId: string | undefined;
-    const nativeReplayEnabled = clientSupportsSubagents(this.clientCapabilities);
+    // Only AIR's draft replays child sessions so far. A client on the RFD gets
+    // no children on replay, which the RFD allows (it SHOULD replay them), until
+    // the replay keeps the children's live session ids.
+    const nativeReplayEnabled = subagentForm(this.clientCapabilities) === "air";
     const replayCompactionUpdates = clientSupportsCompactionUpdates(this.clientCapabilities);
     const replayTerminalStates = new Map<string, "completed" | "failed" | "cancelled">();
     const replayChildren = new Map<
@@ -8122,6 +8137,21 @@ export class ClaudeAcpAgent {
     return response;
   }
 
+  /** Runs `request`, a request that `requestSessionId` sends for the session
+   *  `ownerSessionId`. When that is a subagent's child session, the child
+   *  reports that it awaits the user while the request is open (the RFD form,
+   *  see `NativeSubagentRuntime.awaitingUser`). */
+  private withChildAwaitingUser<T>(
+    ownerSessionId: string,
+    requestSessionId: string,
+    request: () => Promise<T>,
+  ): Promise<T> {
+    const runtime = this.sessions[ownerSessionId]?.nativeSubagentRuntime;
+    return runtime && requestSessionId !== ownerSessionId
+      ? runtime.awaitingUser(requestSessionId, request)
+      : request();
+  }
+
   /** Mark a client request as blocking on user input for exactly the lifetime
    *  of its promise. Steering consults this session-local count synchronously,
    *  so a message arriving while any permission/elicitation card is open uses
@@ -8196,8 +8226,10 @@ export class ClaudeAcpAgent {
     // The request goes to a subagent's child session for a tool call of that
     // subagent, but it blocks the turn of the owner session.
     try {
-      return await this.withPendingUserInput(ownerSessionId, () =>
-        raceWithAbort(this.client.requestPermission(params, signal), signal),
+      return await this.withChildAwaitingUser(ownerSessionId, params.sessionId, () =>
+        this.withPendingUserInput(ownerSessionId, () =>
+          raceWithAbort(this.client.requestPermission(params, signal), signal),
+        ),
       );
     } catch (error) {
       if (signal.aborted) {
@@ -8574,8 +8606,10 @@ export class ClaudeAcpAgent {
     );
     let response;
     try {
-      response = await this.withPendingUserInput(sessionId, () =>
-        this.client.createElicitation(createRequest, signal),
+      response = await this.withChildAwaitingUser(sessionId, requestSessionId, () =>
+        this.withPendingUserInput(sessionId, () =>
+          this.client.createElicitation(createRequest, signal),
+        ),
       );
     } catch (error) {
       // A cancellation we requested (signal aborted) settles as an aborted tool

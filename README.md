@@ -37,14 +37,25 @@ npm install @agentclientprotocol/claude-agent-acp@preview
 
 ### Subagent sessions
 
-Subagents are exposed only after bilateral capability negotiation. Until the released ACP SDKs
-preserve the draft `clientCapabilities.subagents` field, a supporting client may advertise
-`nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`; the adapter mirrors the capability
-in its initialize response. The canonical field remains supported and takes precedence once it is
-available. Without either client signal, Agent/Task lifecycle keeps its legacy ordinary ACP
-tool-call representation and child interactions stay on the root session. Clients that use the
-historical `_meta["subagent-transcript"]` capability or `forwardSubagentText` session option retain
-the flattened child transcript behavior. See [AIR extensions](docs/air-extensions.md#native-subagent-sessions).
+A client that declares `clientCapabilities.subagents` gets each Agent or Task subagent as its own
+child session, following the [subagents RFD](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/subagents.mdx):
+
+- `subagent_update` on the parent announces the child before any of its traffic, with the
+  parent's `title` and `description` for it, and reports its work state: `running`,
+  `requires_action` while one of its requests is open, and `idle` with a stop reason. The child
+  keeps its session for every delegation to it.
+- The prompt of each delegation is a `session_message` in the child's transcript. The Agent, Task,
+  or SendMessage tool call stays a tool call of the parent.
+- A client cannot prompt, cancel, or otherwise change a child yet, and a replay does not restore
+  children yet.
+
+JetBrains AIR keeps the earlier draft of the RFD (`subagent_spawned`, `subagent_state_update`),
+which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`. See
+[AIR extensions](docs/air-extensions.md#native-subagent-sessions).
+
+Without either signal, Agent and Task stay ordinary tool calls and child interactions stay on the
+root session. Clients that use the historical `_meta["subagent-transcript"]` capability or the
+`forwardSubagentText` session option retain the flattened child transcript.
 
 ## Contribution Policy
 
