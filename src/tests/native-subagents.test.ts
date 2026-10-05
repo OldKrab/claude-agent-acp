@@ -7,6 +7,7 @@ import {
   NativeSubagentRuntime,
   NativeSubagentSession,
   resumedNativeSubagentId,
+  sendMessageResume,
   sendMessageResumePrompt,
 } from "../native-subagents.js";
 
@@ -622,6 +623,18 @@ describe("NativeSubagentRuntime lifecycle", () => {
       expect(sendMessageResumePrompt(toolUses, "worker-3")).toBeUndefined();
     });
 
+    it("names the SendMessage call that resumed the agent even without a text", () => {
+      const toolUses = {
+        blank: { name: "SendMessage", input: { to: "worker-1", message: " " } },
+        bash: { name: "Bash", input: { command: "ls" } },
+      };
+
+      expect(sendMessageResume(toolUses, "worker-1", ["blank"])).toEqual({ toolUseId: "blank" });
+      expect(sendMessageResume(toolUses, "worker-1")).toEqual({ toolUseId: "blank" });
+      expect(sendMessageResume(toolUses, "worker-1", ["bash"])).toBeUndefined();
+      expect(sendMessageResumePrompt(toolUses, "worker-1", ["blank"])).toBeUndefined();
+    });
+
     it("keeps the work of a child tool call in the generation that started it", async () => {
       const published: AcpSessionNotification[] = [];
       const runtime = new NativeSubagentRuntime(
@@ -1084,14 +1097,32 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     expect(states(published).at(-1)).toEqual({ state: "idle", stopReason: "cancelled" });
   });
 
-  it("ends the children that still run with the stream: cancelled after a cancel, else failed", async () => {
+  it("ends the children that still run with the stream as idle, with no reason it did not see", async () => {
+    // After a cancel, a child that still runs is a background child that
+    // outlived it: the stream's end is no evidence that it was cancelled.
     const cancelled = await runningWorker();
     await cancelled.runtime.finishAll("cancelled", async () => {});
-    expect(states(cancelled.published).at(-1)).toEqual({ state: "idle", stopReason: "cancelled" });
+    expect(states(cancelled.published).at(-1)).toEqual({ state: "idle" });
 
     const failed = await runningWorker();
     await failed.runtime.finishAll("failed", async () => {});
     expect(states(failed.published).at(-1)).toEqual({ state: "idle" });
+    // A later error event does not turn that end into a failure.
+    await failed.runtime.finishTask("worker-1", "failed", async () => {}, undefined, {
+      error: "boom",
+    });
+    expect(states(failed.published)).toHaveLength(2);
+  });
+
+  it("keeps a SendMessage result without a text from resuming a run that ended", async () => {
+    const { runtime, published } = await runningWorker();
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+    await runtime.taskStarted({ taskId: "worker-1", toolUseId: "send-1" }, async () => {});
+    await runtime.finishTask("worker-1", "completed", async () => {}, "send-1");
+
+    expect(runtime.isEndedDelegation("worker-1", "send-1")).toBe(true);
+    await runtime.sendMessageResumed("worker-1", async () => {}, undefined, "send-1");
+    expect(states(published).at(-1)).toEqual({ state: "idle", stopReason: "end_turn" });
   });
 
   it("reports a child that can no longer be observed as unknown", async () => {

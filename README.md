@@ -49,6 +49,10 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
 - The prompt of the Agent or Task call that launches the child, and the message of each
   SendMessage call that resumes it, is a `session_message` in the child's transcript. The tool
   call stays a tool call of the session that made it.
+- `session/cancel` on the parent stops the foreground children that its turn waits on, which then
+  report `idle` with `cancelled`, and their open requests are withdrawn. A background child keeps
+  running, and its open requests stay answerable. A child that still runs when Claude Code exits
+  is `idle` with no stop reason.
 - A child whose parent is not yet known when it ends is not exposed, since the RFD forbids
   guessing its parent.
 - A client cannot prompt, cancel, or otherwise change a child yet, and a replay does not restore

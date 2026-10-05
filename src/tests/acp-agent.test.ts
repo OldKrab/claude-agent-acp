@@ -6201,6 +6201,124 @@ describe("subagent permission attribution (issue #851)", () => {
       expect(agent.sessions["test-session"]?.liveBackgroundTasks.has("agent-42")).toBe(false);
     });
 
+    // agentclientprotocol/agent-client-protocol#2308: a cancel stops the
+    // descendant work that the cancelled work waits on, and leaves the rest
+    // to the Agent; the Client cleans up a descendant's requests only once it
+    // reports a cancelled idle.
+    it("at a root cancel, stops the foreground child and leaves the background child running", async () => {
+      const log: string[] = [];
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: AcpSessionNotification) => {
+            updates.push(update);
+            if (update.update.sessionUpdate === "subagent_update") {
+              log.push(`${update.update.sessionId} ${JSON.stringify(update.update.state)}`);
+            }
+          },
+          requestPermission: (params: { sessionId: string }, signal?: AbortSignal) => {
+            log.push(`request @${params.sessionId}`);
+            signal?.addEventListener("abort", () => log.push(`withdrawn @${params.sessionId}`));
+            return new Promise(() => {});
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities,
+      });
+
+      const later = new Pushable<unknown>();
+      const input = new Pushable<any>();
+      let started!: () => void;
+      const ready = new Promise<void>((resolve) => (started = resolve));
+      const launch = (id: string, input: Record<string, unknown>) =>
+        rootToolUse(id, "Agent", { description: id, prompt: "Work", ...input });
+      async function* stream() {
+        const { value } = await input[Symbol.asyncIterator]().next();
+        yield userEcho(value);
+        yield launch("toolu_fg", { subagent_type: "Explore" });
+        yield { ...taskStarted("agent-fg", "toolu_fg"), subagent_type: "Explore" };
+        yield launch("toolu_bg", { subagent_type: "Explore", run_in_background: true });
+        yield {
+          ...taskStarted("agent-bg", "toolu_bg"),
+          subagent_type: "Explore",
+          is_backgrounded: true,
+        };
+        started();
+        yield* later;
+      }
+      const query = wrapQuery(stream());
+      // The CLI's interrupt (read in the bundled CLI): the foreground child's
+      // abort controller is linked to the turn's, so its request is withdrawn
+      // and its run reports killed, then stopped, then the turn goes idle. The
+      // background child's is not linked, so nothing happens to it.
+      const foreground = new AbortController();
+      query.interrupt = vi.fn(async () => {
+        foreground.abort();
+        setTimeout(() => {
+          later.push({ ...taskUpdated({ status: "killed" }), task_id: "agent-fg" });
+          later.push({ ...taskNotification("toolu_fg", "stopped"), task_id: "agent-fg" });
+          later.push({
+            type: "system",
+            subtype: "session_state_changed",
+            state: "idle",
+            uuid: randomUUID(),
+            session_id: "test-session",
+          });
+        }, 5);
+      });
+      agent.sessions["test-session"] = mockSessionState({ query, input });
+
+      const prompt = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] })
+        .then((response) => {
+          log.push(`prompt ${response.stopReason}`);
+          return response;
+        });
+      await ready;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const canUseTool = agent.canUseTool("test-session");
+      const ask = (agentID: string, signal: AbortSignal) =>
+        canUseTool("Bash", { command: "make" }, {
+          signal,
+          suggestions: [],
+          toolUseID: `${agentID}-bash`,
+          agentID,
+        } as never).catch(() => {});
+      void ask("agent-fg", foreground.signal);
+      void ask("agent-bg", new AbortController().signal);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      await agent.cancel({ sessionId: "test-session" });
+      await prompt;
+      const atResponse = [...log];
+      // The CLI process exits while the background child still runs.
+      later.end();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const before = (prefix: string) => atResponse.filter((line) => line.startsWith(prefix));
+      // The foreground child: withdrawn, then reported cancelled before the
+      // cancelled prompt resolves.
+      expect(atResponse).toContain("withdrawn @agent-fg");
+      expect(before("agent-fg ").at(-1)).toBe('agent-fg {"state":"idle","stopReason":"cancelled"}');
+      expect(atResponse.at(-1)).toBe("prompt cancelled");
+      // The background child keeps running, with its request still open.
+      expect(atResponse).not.toContain("withdrawn @agent-bg");
+      expect(before("agent-bg ")).toEqual([
+        'agent-bg {"state":"running"}',
+        'agent-bg {"state":"requires_action"}',
+      ]);
+      // When the stream ends, its end has no reason the adapter saw.
+      expect(log.filter((line) => line.startsWith("agent-bg ")).at(-1)).toBe(
+        'agent-bg {"state":"idle"}',
+      );
+      for (const payload of updates) {
+        expect(validateRecorded({ kind: "sessionUpdate", payload }, new Set())).toEqual([]);
+      }
+    });
+
     it("adds the SDK's error to a failure that a notification reported first", async () => {
       const updates = await run([
         { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },

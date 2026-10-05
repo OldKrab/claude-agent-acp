@@ -8401,7 +8401,8 @@ export class ClaudeAcpAgent {
           ? (() => {
               const child = session.nativeSubagentsByTaskId?.get(agentID);
               // A request must never target a child session before its
-              // subagent_spawned notification. In the rare SDK ordering where
+              // announcement (subagent_spawned for AIR, subagent_update in
+              // the RFD form). In the rare SDK ordering where
               // canUseTool beats the spawning Agent/Task frame, keep the
               // permission on the root session; the later frame will announce
               // the child with correct nested lineage.

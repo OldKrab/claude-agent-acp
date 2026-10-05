@@ -64,6 +64,11 @@ export type TaskEnd = {
   error?: string;
   /** The SDK's reason for an unusual end, such as `worker_restart`. */
   reason?: string;
+  /**
+   * The adapter knows that the work ended, but not why: the stream ended, or
+   * the conversation was reset, with the task still running.
+   */
+  unexplained?: boolean;
 };
 
 type TaskStarted = {
@@ -417,7 +422,7 @@ export class NativeSubagentRuntime {
         }
         if (this.form === "rfd") {
           await this.reportState(child, rfdEndState(state, end));
-          child.missingError = state === "failed" && !end?.error;
+          child.missingError = state === "failed" && !end?.error && !end?.unexplained;
           if (child.parentToolUseId) (child.endedRuns ??= new Set()).add(child.parentToolUseId);
         } else {
           await finishNativeSubagent(this.session, taskId, state, this.publish);
@@ -436,12 +441,20 @@ export class NativeSubagentRuntime {
     }
   }
 
+  /**
+   * Ends every child that still runs, because the stream ended or the
+   * conversation was reset. AIR's draft reports `state` for each. In the RFD
+   * form the cause of each child's end is unknown, so it is idle with no stop
+   * reason: a child that a cancel stopped already reported it from the SDK's
+   * events, and a background child that outlived the cancel was not cancelled.
+   */
   async finishAll(state: SubagentState, deliver: Publish): Promise<void> {
     const errors: unknown[] = [];
+    const end = this.form === "rfd" ? { unexplained: true } : undefined;
     try {
       for (const taskId of [...this.children.keys()].reverse()) {
         try {
-          await this.finishTask(taskId, state, deliver);
+          await this.finishTask(taskId, state, deliver, undefined, end);
         } catch (error) {
           errors.push(error);
         }
@@ -460,8 +473,10 @@ export class NativeSubagentRuntime {
   /**
    * The parent session got `session/cancel`. AIR's draft ends every child as
    * cancelled here. The RFD form reports nothing: acknowledging a cancel is no
-   * evidence that a child stopped, and a background subagent outlives the
-   * interrupt. The SDK's task events, or the end of the stream, end it.
+   * evidence that a child stopped. The interrupt stops the foreground children
+   * that the turn waits on, which the SDK's task events then report as
+   * cancelled; a background child keeps running, and keeps its open requests
+   * (agentclientprotocol/agent-client-protocol#2308).
    */
   async parentCancelled(deliver: Publish): Promise<void> {
     if (this.form === "air") await this.finishAll("cancelled", deliver);
@@ -919,11 +934,12 @@ function isWorking(child: NativeSubagent): boolean {
  * is closed. Until the SDK has it, the failure goes in
  * `_meta.claudeCode.error`, as the v2 surface does for a failed turn.
  *
- * A task that a worker restart orphaned is idle with no stop reason: its
- * work ended, but nobody cancelled it, which the RFD forbids claiming.
+ * A task that a worker restart orphaned, or that was still running when the
+ * stream ended, is idle with no stop reason: its work ended, but the adapter
+ * did not see a cancellation or a failure, which the RFD forbids claiming.
  */
 function rfdEndState(state: SubagentState, end: TaskEnd | undefined): WorkState {
-  if (end?.reason === "worker_restart") return { state: "idle" };
+  if (end?.unexplained || end?.reason === "worker_restart") return { state: "idle" };
   switch (state) {
     case "completed":
       return { state: "idle", stopReason: "end_turn" };
@@ -989,25 +1005,31 @@ export function sendMessageResumePrompt(
   return sendMessageResume(toolUses, agentId, resultToolUseIds)?.text;
 }
 
-/** The SendMessage call that resumed the agent `agentId`, and its text; see {@link sendMessageResumePrompt}. */
+/**
+ * The SendMessage call that resumed the agent `agentId`, and its text when it
+ * has one; see {@link sendMessageResumePrompt}. The call is known even
+ * without text, so a late result still names the delegation it reports.
+ */
 export function sendMessageResume(
   toolUses: Record<string, { name: string; input: unknown } | undefined>,
   agentId: string,
   resultToolUseIds: readonly string[] = [],
-): { toolUseId: string; text: string } | undefined {
+): { toolUseId: string; text?: string } | undefined {
+  let withoutText: string | undefined;
   for (const toolUseId of resultToolUseIds) {
     const toolUse = toolUses[toolUseId];
     if (toolUse?.name !== "SendMessage") continue;
     const text = promptText((toolUse.input as { message?: unknown } | null)?.message);
     if (text) return { toolUseId, text };
+    withoutText ??= toolUseId;
   }
-  if (resultToolUseIds.length > 0) return undefined;
+  if (resultToolUseIds.length > 0) return withoutText ? { toolUseId: withoutText } : undefined;
   for (const [toolUseId, toolUse] of Object.entries(toolUses).reverse()) {
     if (toolUse?.name !== "SendMessage") continue;
     const input = toolUse.input as { to?: unknown; message?: unknown } | null;
     if (input?.to !== agentId) continue;
     const text = promptText(input.message);
-    return text ? { toolUseId, text } : undefined;
+    return text ? { toolUseId, text } : { toolUseId };
   }
   return undefined;
 }
