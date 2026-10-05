@@ -201,10 +201,6 @@ function isMeta(key: string): boolean {
   return key.startsWith("_meta.");
 }
 
-/**
- * Returns the differences between the baseline and the current traffic that
- * the compatibility rule does not allow. An empty list means compatible.
- */
 /** `record` without the agent subagent capability, when it is an `initialize` response. */
 function withoutAgentSubagentCapability(record: Recorded): Recorded {
   if (record.kind !== "initialize") return record;
@@ -221,6 +217,10 @@ function withoutAgentSubagentCapability(record: Recorded): Recorded {
   } as Recorded;
 }
 
+/**
+ * Returns the differences between the baseline and the current traffic that
+ * the compatibility rule does not allow. An empty list means compatible.
+ */
 export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): string[] {
   const expected = baseline
     .map((record) => withoutAgentSubagentCapability(withoutAirOnlyKeys(record) as Recorded))

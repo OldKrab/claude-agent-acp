@@ -5491,6 +5491,7 @@ export class ClaudeAcpAgent {
                   message.status,
                   sendUpdate,
                   message.tool_use_id,
+                  { reason: message.reason },
                 );
                 await asyncTasks.taskNotification({
                   task_id: message.task_id,
@@ -5523,7 +5524,7 @@ export class ClaudeAcpAgent {
                     message.patch.status,
                     sendUpdate,
                     undefined,
-                    message.patch.status === "failed" ? message.patch.error : undefined,
+                    { error: message.patch.status === "failed" ? message.patch.error : undefined },
                   );
                   const parentToolUseId = session.liveBackgroundTasks.get(
                     message.task_id,

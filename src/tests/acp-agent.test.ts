@@ -5479,6 +5479,25 @@ describe("subagent permission attribution (issue #851)", () => {
     };
   }
 
+  /** The call `toolUseId` of the tool `name` that the root session makes. */
+  function rootToolUse(toolUseId: string, name: string, input: Record<string, unknown> = {}) {
+    return {
+      type: "assistant" as const,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      parent_tool_use_id: null,
+      message: {
+        id: `msg-${toolUseId}`,
+        model: "claude-sonnet-4-5",
+        role: "assistant" as const,
+        type: "message",
+        stop_reason: "tool_use",
+        content: [{ type: "tool_use" as const, id: toolUseId, name, input }],
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    };
+  }
+
   function successResult() {
     return {
       type: "result" as const,
@@ -5839,7 +5858,11 @@ describe("subagent permission attribution (issue #851)", () => {
         protocolVersion: 1,
         clientCapabilities: { subagents: {} } as ClientCapabilities,
       });
-      injectGeneratorSession(agent, makeGenerator([...frames, successResult()] as never));
+      // The root's Agent call comes first: the child's parent is the root.
+      injectGeneratorSession(
+        agent,
+        makeGenerator([rootToolUse("toolu_parent", "Agent"), ...frames, successResult()] as never),
+      );
       await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
       // Every update is a valid v1 session update, without an extension.
       for (const payload of updates) {
@@ -5936,11 +5959,170 @@ describe("subagent permission attribution (issue #851)", () => {
         taskUpdated({ status: "completed" }),
       ]);
 
+      expect(subagentTraffic(updates).length).toBeGreaterThan(0);
       expect(
         updates.filter(({ update }) =>
           ["subagent_spawned", "subagent_state_update"].includes(update.sessionUpdate),
         ),
       ).toEqual([]);
+    });
+
+    const taskNotification = (
+      toolUseId: string,
+      status: string,
+      extra: Record<string, unknown> = {},
+    ) => ({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "agent-42",
+      tool_use_id: toolUseId,
+      status,
+      output_file: "",
+      summary: "done",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...extra,
+    });
+
+    it("keeps the child's session for a SendMessage resume, which the SDK runs under the SendMessage id", async () => {
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore", prompt: "Go" },
+        taskNotification("toolu_parent", "completed"),
+        rootToolUse("toolu_send", "SendMessage", {
+          to: "agent-42",
+          message: "Also check Windows",
+        }),
+        // The CLI starts the resumed agent again, under the SendMessage call.
+        {
+          ...taskStarted("agent-42", "toolu_send"),
+          subagent_type: "Explore",
+          prompt: "Also check Windows",
+        },
+        {
+          type: "stream_event",
+          parent_tool_use_id: "toolu_send",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "Checking Windows" },
+          },
+        },
+        // A late copy of the first delegation's end does not end the second.
+        taskNotification("toolu_parent", "completed"),
+        taskNotification("toolu_send", "completed"),
+      ]);
+
+      const traffic = subagentTraffic(updates).map(({ sessionId, update }) => ({
+        sessionId,
+        update:
+          update.sessionUpdate === "subagent_update"
+            ? {
+                sessionUpdate: update.sessionUpdate,
+                sessionId: update.sessionId,
+                state: update.state,
+              }
+            : update,
+      }));
+      expect(traffic).toEqual([
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            state: { state: "running" },
+          },
+        },
+        {
+          sessionId: "agent-42",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "toolu_parent",
+            senderSessionId: "test-session",
+            recipientSessionId: "agent-42",
+            content: [{ type: "text", text: "Go" }],
+          },
+        },
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            state: { state: "idle", stopReason: "end_turn" },
+          },
+        },
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            state: { state: "running" },
+          },
+        },
+        {
+          sessionId: "agent-42",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "toolu_send",
+            senderSessionId: "test-session",
+            recipientSessionId: "agent-42",
+            content: [{ type: "text", text: "Also check Windows" }],
+          },
+        },
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            state: { state: "idle", stopReason: "end_turn" },
+          },
+        },
+      ]);
+      // The resumed run's output reaches the same child session.
+      expect(
+        updates.filter(
+          ({ sessionId, update }) =>
+            sessionId === "agent-42" && update.sessionUpdate === "agent_message_chunk",
+        ),
+      ).toHaveLength(1);
+    });
+
+    it("adds the SDK's error to a failure that a notification reported first", async () => {
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        taskNotification("toolu_parent", "failed"),
+        taskUpdated({ status: "failed", error: "Context too small" }),
+      ]);
+
+      expect(
+        subagentTraffic(updates)
+          .slice(-2)
+          .map(({ update }) => update),
+      ).toEqual([
+        { sessionUpdate: "subagent_update", sessionId: "agent-42", state: { state: "idle" } },
+        {
+          sessionUpdate: "subagent_update",
+          sessionId: "agent-42",
+          state: {
+            state: "idle",
+            _meta: { claudeCode: { error: { code: -32603, message: "Context too small" } } },
+          },
+        },
+      ]);
+    });
+
+    it("reports a child that a worker restart orphaned as idle, not cancelled", async () => {
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        taskNotification("toolu_parent", "stopped", { reason: "worker_restart" }),
+      ]);
+
+      expect(subagentTraffic(updates).at(-1)?.update).toEqual({
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-42",
+        state: { state: "idle" },
+      });
     });
   });
 
@@ -6392,6 +6574,8 @@ describe("subagent permission attribution (issue #851)", () => {
       agent,
       makeGenerator([
         ...childMessages,
+        // The spawn arrives after the child's output, which waits for it.
+        rootToolUse("toolu_parent", "Agent"),
         { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
         {
           type: "system",

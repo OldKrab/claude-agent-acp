@@ -68,8 +68,8 @@ describe("NativeSubagentRuntime lifecycle", () => {
       await release.promise;
     });
 
-    const first = announceNativeSubagent(value, publish);
-    const second = announceNativeSubagent(value, publish);
+    const first = announceNativeSubagent(value, publish, "air");
+    const second = announceNativeSubagent(value, publish, "air");
 
     await Promise.resolve();
     expect(publish).toHaveBeenCalledTimes(1);
@@ -729,6 +729,23 @@ describe("NativeSubagentRuntime in the RFD form", () => {
         _meta: { claudeCode: { parentToolUseId } },
       },
     }) as AcpSessionNotification;
+  /** A SendMessage call, of the root or of the child that `parentToolUseId` launched. */
+  const sendMessage = (toolCallId: string, parentToolUseId?: string): AcpSessionNotification =>
+    ({
+      sessionId: "root",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: "SendMessage",
+        status: "pending",
+        _meta: {
+          claudeCode: {
+            toolName: "SendMessage",
+            ...(parentToolUseId ? { parentToolUseId } : {}),
+          },
+        },
+      },
+    }) as AcpSessionNotification;
 
   /** A runtime whose child `worker-1` was launched by `launch-1` and runs. */
   async function runningWorker(input: Record<string, unknown> = {}) {
@@ -808,6 +825,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     await expect(runtime.route(output("launch-1"), async () => {})).resolves.toMatchObject({
       sessionId: "worker-1",
     });
+    await runtime.route(sendMessage("send-1"), async () => {});
     await runtime.taskResumed("worker-1", async () => {}, "Check the tests too", "send-1");
     // A repeated resume signal of the running child changes nothing.
     await runtime.taskResumed("worker-1", async () => {}, "Check the tests too", "send-1");
@@ -835,6 +853,120 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     expect(
       published.some(({ update }) => "sessionId" in update && update.sessionId !== "worker-1"),
     ).toBe(false);
+  });
+
+  it("moves the work of a resume to the child, under the id of the call that resumed it", async () => {
+    const { runtime, published } = await runningWorker();
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+    await runtime.route(sendMessage("send-1"), async () => {});
+    // The resumed run's output can arrive before the SDK's task_started.
+    await expect(runtime.route(output("send-1"), async () => {})).resolves.toBeNull();
+
+    const delivered: AcpSessionNotification[] = [];
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "send-1", prompt: "Check the tests too" },
+      async (notification) => {
+        delivered.push(notification);
+      },
+    );
+    // The resume signal of the SendMessage result repeats it, and changes nothing.
+    await runtime.taskResumed("worker-1", async () => {}, "Check the tests too", "send-1");
+
+    // The waiting output is delivered for routing again, which now finds the child.
+    expect(delivered).toEqual([output("send-1")]);
+    await expect(runtime.route(output("send-1"), async () => {})).resolves.toMatchObject({
+      sessionId: "worker-1",
+    });
+    // The end of the first delegation, again, does not end the second.
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+    expect(states(published).at(-1)).toEqual({ state: "running" });
+    await runtime.finishTask("worker-1", "completed", async () => {}, "send-1");
+    expect(states(published)).toEqual([
+      { state: "running" },
+      { state: "idle", stopReason: "end_turn" },
+      { state: "running" },
+      { state: "idle", stopReason: "end_turn" },
+    ]);
+    expect(
+      published
+        .filter(({ update }) => update.sessionUpdate === "session_message")
+        .map(({ update }) => (update as { messageId: string }).messageId),
+    ).toEqual(["launch-1", "send-1"]);
+  });
+
+  it("names the session that sent a resume's prompt, and no sender when it is unknown", async () => {
+    const { runtime, published } = await runningWorker();
+    // worker-1 launches worker-2, which the root then resumes.
+    await runtime.route(launch("launch-2", { description: "Dig" }, "launch-1"), async () => {});
+    await runtime.taskStarted(
+      { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Explore" },
+      async () => {},
+    );
+    await runtime.finishTask("worker-2", "completed", async () => {}, "launch-2");
+    await runtime.route(sendMessage("send-root"), async () => {});
+    await runtime.taskResumed("worker-2", async () => {}, "From the root", "send-root");
+    await runtime.finishTask("worker-2", "completed", async () => {}, "send-root");
+    // worker-1 resumes it too.
+    await runtime.route(sendMessage("send-worker", "launch-1"), async () => {});
+    await runtime.taskResumed("worker-2", async () => {}, "From worker-1", "send-worker");
+    await runtime.finishTask("worker-2", "completed", async () => {}, "send-worker");
+    // A call the runtime never routed has no known sender.
+    await runtime.taskResumed("worker-2", async () => {}, "From someone", "send-unknown");
+
+    const senders = published.flatMap(({ sessionId, update }) =>
+      sessionId === "worker-2" && update.sessionUpdate === "session_message"
+        ? [[update.messageId, update.senderSessionId]]
+        : [],
+    );
+    expect(senders).toEqual([
+      ["send-root", "root"],
+      ["send-worker", "worker-1"],
+      ["send-unknown", undefined],
+    ]);
+  });
+
+  it("keeps a nested child that ends before its parent is known unexposed", async () => {
+    const { runtime, published } = await runningWorker();
+    // worker-2's spawning frame has not arrived, so its parent is unknown.
+    await runtime.taskStarted(
+      { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Explore" },
+      async () => {},
+    );
+    await expect(runtime.route(output("launch-2"), async () => {})).resolves.toBeNull();
+    await runtime.finishTask("worker-2", "completed", async () => {}, "launch-2");
+    // The frame arrives late: it is the tool call of worker-1 that made it.
+    await expect(
+      runtime.route(launch("launch-2", { description: "Dig" }, "launch-1"), async () => {}),
+    ).resolves.toMatchObject({ sessionId: "worker-1" });
+
+    expect(
+      published.some(
+        ({ update }) =>
+          (update.sessionUpdate === "subagent_update" && update.sessionId === "worker-2") ||
+          (update.sessionUpdate === "session_message" && update.recipientSessionId === "worker-2"),
+      ),
+    ).toBe(false);
+    expect(published.some(({ sessionId }) => sessionId === "worker-2")).toBe(false);
+  });
+
+  it("keeps the role in the title when a late frame names the child", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      "rfd",
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+    );
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+      async () => {},
+    );
+    await runtime.route(launch("launch-1", { name: "builder" }), async () => {});
+
+    expect(published[0]?.update).toMatchObject({ title: "builder (Explore)" });
   });
 
   it("reports nothing when the parent is cancelled, until the SDK ends the child", async () => {
