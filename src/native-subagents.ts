@@ -766,6 +766,16 @@ export class NativeSubagentRuntime {
     for (const pending of toolUseId ? this.takePending(toolUseId) : []) await deliver(pending);
   }
 
+  /**
+   * The ACP session id of a child: the SDK agent id, and in AIR's draft a
+   * generation suffix for each resume. The RFD needs it unique within the
+   * connection and never under two parents. Agent ids are random, and an
+   * agent keeps its parent, so only a fork could repeat one under another
+   * root. That holds today because the SDK's `forkSession` copies no
+   * `subagents/` history, so a fork cannot resume an agent of the original.
+   * If a fork ever can, the RFD requires remapping the copied ids, for
+   * example by deriving the child id from the root session id.
+   */
   private nextChildSessionId(taskId: string, previous: NativeSubagent | undefined): string {
     if (!previous) {
       this.generationByTaskId.set(taskId, 1);
