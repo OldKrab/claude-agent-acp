@@ -826,9 +826,9 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       sessionId: "worker-1",
     });
     await runtime.route(sendMessage("send-1"), async () => {});
-    await runtime.taskResumed("worker-1", async () => {}, "Check the tests too", "send-1");
+    await runtime.sendMessageResumed("worker-1", async () => {}, "Check the tests too", "send-1");
     // A repeated resume signal of the running child changes nothing.
-    await runtime.taskResumed("worker-1", async () => {}, "Check the tests too", "send-1");
+    await runtime.sendMessageResumed("worker-1", async () => {}, "Check the tests too", "send-1");
     await runtime.finishTask("worker-1", "completed", async () => {});
 
     expect(states(published)).toEqual([
@@ -870,7 +870,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       },
     );
     // The resume signal of the SendMessage result repeats it, and changes nothing.
-    await runtime.taskResumed("worker-1", async () => {}, "Check the tests too", "send-1");
+    await runtime.sendMessageResumed("worker-1", async () => {}, "Check the tests too", "send-1");
 
     // The waiting output is delivered for routing again, which now finds the child.
     expect(delivered).toEqual([output("send-1")]);
@@ -894,6 +894,77 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     ).toEqual(["launch-1", "send-1"]);
   });
 
+  it("ignores a SendMessage result that arrives after the run it started ended", async () => {
+    const { runtime, published } = await runningWorker();
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "send-1", prompt: "Check the tests too" },
+      async () => {},
+    );
+    // The terminal patch carries no tool id; the notification repeats it.
+    await runtime.finishTask("worker-1", "failed", async () => {});
+    await runtime.finishTask("worker-1", "failed", async () => {}, "send-1");
+
+    expect(runtime.isEndedDelegation("worker-1", "send-1")).toBe(true);
+    await runtime.sendMessageResumed("worker-1", async () => {}, "Check the tests too", "send-1");
+    expect(states(published)).toEqual([
+      { state: "running" },
+      { state: "idle", stopReason: "end_turn" },
+      { state: "running" },
+      { state: "idle" },
+    ]);
+  });
+
+  it("ends a run under an id the child used before, which the SDK falls back to", async () => {
+    const { runtime, published } = await runningWorker();
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+    await runtime.taskStarted({ taskId: "worker-1", toolUseId: "send-1" }, async () => {});
+    await runtime.finishTask("worker-1", "completed", async () => {}, "send-1");
+    // A resume that no call made runs under the launch's id again.
+    await runtime.taskStarted({ taskId: "worker-1", toolUseId: "launch-1" }, async () => {});
+
+    expect(runtime.isStaleEnd("worker-1", "send-1")).toBe(true);
+    expect(runtime.isStaleEnd("worker-1", "launch-1")).toBe(false);
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+    expect(states(published).at(-1)).toEqual({ state: "idle", stopReason: "end_turn" });
+    expect(states(published)).toHaveLength(6);
+  });
+
+  it("reports a running patch as running, without its guessed prompt or call", async () => {
+    const { runtime, published } = await runningWorker();
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+    await runtime.taskResumed("worker-1", async () => {}, "An old message");
+
+    expect(states(published).at(-1)).toEqual({ state: "running" });
+    expect(
+      published.filter(({ update }) => update.sessionUpdate === "session_message"),
+    ).toHaveLength(1);
+    expect(runtime.isStaleEnd("worker-1", "launch-1")).toBe(false);
+  });
+
+  it("resumes a child with an open request as requires_action", async () => {
+    const { runtime, published } = await runningWorker();
+    let answer!: () => void;
+    const request = runtime.awaitingUser(
+      "worker-1",
+      () => new Promise<void>((resolve) => (answer = resolve)),
+    );
+    await Promise.resolve();
+    // The work ends while the request is open; then a resume runs it again.
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+    await runtime.taskStarted({ taskId: "worker-1", toolUseId: "send-1" }, async () => {});
+    answer();
+    await request;
+
+    expect(states(published)).toEqual([
+      { state: "running" },
+      { state: "requires_action" },
+      { state: "idle", stopReason: "end_turn" },
+      { state: "requires_action" },
+      { state: "running" },
+    ]);
+  });
+
   it("names the session that sent a resume's prompt, and no sender when it is unknown", async () => {
     const { runtime, published } = await runningWorker();
     // worker-1 launches worker-2, which the root then resumes.
@@ -904,14 +975,14 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     );
     await runtime.finishTask("worker-2", "completed", async () => {}, "launch-2");
     await runtime.route(sendMessage("send-root"), async () => {});
-    await runtime.taskResumed("worker-2", async () => {}, "From the root", "send-root");
+    await runtime.sendMessageResumed("worker-2", async () => {}, "From the root", "send-root");
     await runtime.finishTask("worker-2", "completed", async () => {}, "send-root");
     // worker-1 resumes it too.
     await runtime.route(sendMessage("send-worker", "launch-1"), async () => {});
-    await runtime.taskResumed("worker-2", async () => {}, "From worker-1", "send-worker");
+    await runtime.sendMessageResumed("worker-2", async () => {}, "From worker-1", "send-worker");
     await runtime.finishTask("worker-2", "completed", async () => {}, "send-worker");
     // A call the runtime never routed has no known sender.
-    await runtime.taskResumed("worker-2", async () => {}, "From someone", "send-unknown");
+    await runtime.sendMessageResumed("worker-2", async () => {}, "From someone", "send-unknown");
 
     const senders = published.flatMap(({ sessionId, update }) =>
       sessionId === "worker-2" && update.sessionUpdate === "session_message"
@@ -933,7 +1004,9 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       async () => {},
     );
     await expect(runtime.route(output("launch-2"), async () => {})).resolves.toBeNull();
-    await runtime.finishTask("worker-2", "completed", async () => {}, "launch-2");
+    // A resume signal does not give the unexposed child another call.
+    await runtime.taskStarted({ taskId: "worker-2", toolUseId: "send-9" }, async () => {});
+    await runtime.finishTask("worker-2", "completed", async () => {});
     // The frame arrives late: it is the tool call of worker-1 that made it.
     await expect(
       runtime.route(launch("launch-2", { description: "Dig" }, "launch-1"), async () => {}),

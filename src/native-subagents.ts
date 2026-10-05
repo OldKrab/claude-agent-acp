@@ -39,6 +39,8 @@ export type NativeSubagent = {
   openRequests?: number;
   /** The RFD form: the ids of the prompt messages in the child's transcript. */
   promptIds?: Set<string>;
+  /** The RFD form: the calls that delegated to the child, whose runs ended. */
+  endedRuns?: Set<string>;
   announced?: boolean;
   terminalState?: SubagentState;
   /** Connection-local single-flight state; never serialized on the wire. */
@@ -296,20 +298,19 @@ export class NativeSubagentRuntime {
    * running `task_updated` patch or a SendMessage `resumedAgentId` is the
    * signal. A child that did not finish is not changed. The `prompt` is the
    * SendMessage text that resumed the child, when the adapter knows it.
+   *
+   * In the RFD form, the running patch only reports that the child runs: its
+   * prompt is a guess (the latest SendMessage to the agent), and the
+   * `task_started` or the SendMessage result carries the delegation.
    */
-  async taskResumed(
-    taskId: string,
-    deliver: Publish,
-    prompt?: string,
-    promptMessageId?: string,
-  ): Promise<void> {
+  async taskResumed(taskId: string, deliver: Publish, prompt?: string): Promise<void> {
     if (!this.enabled) return;
     const previous = this.children.get(taskId);
     if (!previous) return;
     const finishing = this.taskFinishPromises.get(taskId) ?? previous.terminalPromise;
     if (finishing) await finishing.catch(() => {});
     if (this.form === "rfd") {
-      await this.resumeChild(previous, taskId, promptText(prompt), promptMessageId, deliver);
+      await this.resumeChild(previous, taskId, undefined, undefined, deliver);
       return;
     }
     if (this.children.get(taskId) !== previous || previous.terminalState === undefined) return;
@@ -325,6 +326,52 @@ export class NativeSubagentRuntime {
       },
       true,
       deliver,
+    );
+  }
+
+  /**
+   * The SDK reports in a SendMessage result that the call `toolUseId`, with
+   * the message `prompt`, resumed the agent `taskId`. AIR's draft treats it as
+   * any resume signal. In the RFD form, the call is the delegation, which the
+   * child takes unless its run already ended: the result can arrive after it.
+   */
+  async sendMessageResumed(
+    taskId: string,
+    deliver: Publish,
+    prompt?: string,
+    toolUseId?: string,
+  ): Promise<void> {
+    if (this.form !== "rfd") return this.taskResumed(taskId, deliver, prompt);
+    const child = this.children.get(taskId);
+    if (!child) return;
+    const finishing = this.taskFinishPromises.get(taskId);
+    if (finishing) await finishing.catch(() => {});
+    if (this.isEndedDelegation(taskId, toolUseId)) return;
+    await this.resumeChild(child, taskId, promptText(prompt), toolUseId, deliver);
+  }
+
+  /**
+   * The RFD form: whether the run of the call `toolUseId` that delegated to
+   * the child `taskId` already ended. AIR's draft has no such runs.
+   */
+  isEndedDelegation(taskId: string, toolUseId: string | null | undefined): boolean {
+    if (this.form !== "rfd" || !toolUseId) return false;
+    return this.children.get(taskId)?.endedRuns?.has(toolUseId) ?? false;
+  }
+
+  /**
+   * The RFD form: whether `toolUseId` is an earlier delegation of the child
+   * `taskId`, whose end does not end the current one. AIR's draft has no
+   * such delegations.
+   */
+  isStaleEnd(taskId: string, toolUseId: string | null | undefined): boolean {
+    if (this.form !== "rfd" || !toolUseId) return false;
+    const child = this.children.get(taskId);
+    return (
+      !!child &&
+      child.parentToolUseId !== undefined &&
+      toolUseId !== child.parentToolUseId &&
+      this.childByParentToolUse.get(toolUseId) === child
     );
   }
 
@@ -345,8 +392,7 @@ export class NativeSubagentRuntime {
     if (child && toolUseId && this.taskByToolUse.get(toolUseId) !== taskId) return;
     if (!state || !child) return;
     if (this.form === "rfd") {
-      // The end of an earlier delegation does not end the current one.
-      if (toolUseId && child.parentToolUseId && toolUseId !== child.parentToolUseId) return;
+      if (this.isStaleEnd(taskId, toolUseId)) return;
       if (!child.announced && !child.announcePromise) {
         this.withdraw(taskId, child);
         return;
@@ -372,6 +418,7 @@ export class NativeSubagentRuntime {
         if (this.form === "rfd") {
           await this.reportState(child, rfdEndState(state, end));
           child.missingError = state === "failed" && !end?.error;
+          if (child.parentToolUseId) (child.endedRuns ??= new Set()).add(child.parentToolUseId);
         } else {
           await finishNativeSubagent(this.session, taskId, state, this.publish);
         }
@@ -451,11 +498,13 @@ export class NativeSubagentRuntime {
   }
 
   /**
-   * The RFD form: the parent delegates to a child again, which keeps its
-   * session. `toolUseId` is the call that delegated, usually a SendMessage:
-   * the SDK runs the resumed work under its id, so the child owns it from now
-   * on, and its prompt is the message with that id. A signal of a delegation
-   * already reported changes nothing.
+   * The RFD form: the child runs again, and keeps its session. `toolUseId` is
+   * the call that delegated, usually a SendMessage: the SDK runs the resumed
+   * work under its id, so it becomes the child's current delegation, whose
+   * end ends the run, and its prompt is the message with that id. A child
+   * that is already working only takes the delegation; a prompt already in
+   * its transcript is not sent again. A child that was never announced is
+   * not changed.
    */
   private async resumeChild(
     child: NativeSubagent,
@@ -464,13 +513,17 @@ export class NativeSubagentRuntime {
     toolUseId: string | undefined,
     deliver: Publish,
   ): Promise<void> {
-    if (toolUseId && this.childByParentToolUse.get(toolUseId) !== child) {
+    if (!child.announced) return;
+    if (toolUseId && toolUseId !== child.parentToolUseId) {
       this.taskByToolUse.set(toolUseId, taskId);
       this.childByParentToolUse.set(toolUseId, child);
       child.parentToolUseId = toolUseId;
     }
-    if (!child.announced) return;
-    if (!isWorking(child)) await this.reportState(child, { state: "running" });
+    if (!isWorking(child)) {
+      await this.reportState(child, {
+        state: child.openRequests ? "requires_action" : "running",
+      });
+    }
     if (prompt && toolUseId) {
       await publishPrompt(
         child,
@@ -487,6 +540,8 @@ export class NativeSubagentRuntime {
    * The RFD form: a child that ends before its parent is known stays
    * unexposed, since the RFD forbids guessing its parent. Its buffered updates
    * are dropped, and it is forgotten, so a late frame does not announce it.
+   * (Buffering until that frame would also meet the RFD, but the frame comes
+   * before the task in the SDK's order, so a child ending without it is rare.)
    */
   private withdraw(taskId: string, child: NativeSubagent): void {
     this.children.delete(taskId);

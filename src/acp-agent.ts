@@ -118,6 +118,7 @@ import {
   nativeSubagentState,
   resumedNativeSubagentId,
   sendMessageResume,
+  sendMessageResumePrompt,
 } from "./native-subagents.js";
 import {
   AIR_ASYNC_TASKS_CAPABILITY,
@@ -5484,6 +5485,10 @@ export class ClaudeAcpAgent {
                 });
                 break;
               case "task_notification":
+                // In the RFD form, a resumed child runs under the call that
+                // resumed it, and the end of an earlier delegation ends
+                // nothing: the child and its live task belong to the new run.
+                if (subagents.isStaleEnd(message.task_id, message.tool_use_id)) break;
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 await subagents.finishTask(
@@ -5538,12 +5543,10 @@ export class ClaudeAcpAgent {
                   // The SDK can resume a finished subagent under the same
                   // agent id without a new task_started.
                   resumeLiveTask(message.task_id);
-                  const resume = sendMessageResume(session.toolUseCache, message.task_id);
                   await subagents.taskResumed(
                     message.task_id,
                     sendUpdate,
-                    resume?.text,
-                    resume?.toolUseId,
+                    sendMessageResumePrompt(session.toolUseCache, message.task_id),
                   );
                 }
                 break;
@@ -6867,7 +6870,6 @@ export class ClaudeAcpAgent {
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
               const resumedAgentId = resumedNativeSubagentId(message.tool_use_result);
               if (resumedAgentId) {
-                resumeLiveTask(resumedAgentId);
                 const resume = sendMessageResume(
                   session.toolUseCache,
                   resumedAgentId,
@@ -6877,12 +6879,17 @@ export class ClaudeAcpAgent {
                       )
                     : [],
                 );
-                await subagents.taskResumed(
-                  resumedAgentId,
-                  sendUpdate,
-                  resume?.text,
-                  resume?.toolUseId,
-                );
+                // In the RFD form the result can arrive after the run it
+                // started ended, and then resumes nothing.
+                if (!subagents.isEndedDelegation(resumedAgentId, resume?.toolUseId)) {
+                  resumeLiveTask(resumedAgentId);
+                  await subagents.sendMessageResumed(
+                    resumedAgentId,
+                    sendUpdate,
+                    resume?.text,
+                    resume?.toolUseId,
+                  );
+                }
               }
             }
 

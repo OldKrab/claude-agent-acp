@@ -5845,6 +5845,10 @@ describe("subagent permission attribution (issue #851)", () => {
     // Each task_started names a subagent type: a task without one is not a subagent.
     /** The updates of `frames`, for a client that declares `subagents`. */
     async function run(frames: unknown[]): Promise<AcpSessionNotification[]> {
+      return (await runAgent(frames)).updates;
+    }
+    /** {@link run}, and the agent that ran the frames. */
+    async function runAgent(frames: unknown[]) {
       const updates: AcpSessionNotification[] = [];
       const agent = new ClaudeAcpAgent(
         {
@@ -5868,7 +5872,7 @@ describe("subagent permission attribution (issue #851)", () => {
       for (const payload of updates) {
         expect(validateRecorded({ kind: "sessionUpdate", payload }, new Set())).toEqual([]);
       }
-      return updates;
+      return { agent, updates };
     }
     const subagentTraffic = (updates: AcpSessionNotification[]) =>
       updates.filter(({ update }) =>
@@ -5967,6 +5971,13 @@ describe("subagent permission attribution (issue #851)", () => {
       ).toEqual([]);
     });
 
+    const childText = (parentToolUseId: string, text: string) => ({
+      type: "stream_event",
+      parent_tool_use_id: parentToolUseId,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+    });
     const taskNotification = (
       toolUseId: string,
       status: string,
@@ -5998,19 +6009,10 @@ describe("subagent permission attribution (issue #851)", () => {
           subagent_type: "Explore",
           prompt: "Also check Windows",
         },
-        {
-          type: "stream_event",
-          parent_tool_use_id: "toolu_send",
-          uuid: randomUUID(),
-          session_id: "test-session",
-          event: {
-            type: "content_block_delta",
-            index: 0,
-            delta: { type: "text_delta", text: "Checking Windows" },
-          },
-        },
+        childText("toolu_send", "Checking Windows"),
         // A late copy of the first delegation's end does not end the second.
         taskNotification("toolu_parent", "completed"),
+        childText("toolu_send", "Still checking"),
         taskNotification("toolu_send", "completed"),
       ]);
 
@@ -6079,13 +6081,58 @@ describe("subagent permission attribution (issue #851)", () => {
           },
         },
       ]);
-      // The resumed run's output reaches the same child session.
-      expect(
-        updates.filter(
-          ({ sessionId, update }) =>
-            sessionId === "agent-42" && update.sessionUpdate === "agent_message_chunk",
-        ),
-      ).toHaveLength(1);
+      // The resumed run's output reaches the same child session, and the
+      // child is idle only after all of it: the late end did not end it.
+      const order = updates.flatMap(({ sessionId, update }) =>
+        sessionId === "agent-42" && update.sessionUpdate === "agent_message_chunk"
+          ? ["output"]
+          : update.sessionUpdate === "subagent_update" && update.state?.state === "idle"
+            ? ["idle"]
+            : [],
+      );
+      expect(order).toEqual(["idle", "output", "output", "idle"]);
+    });
+
+    it("keeps the resumed run's live task when an earlier delegation's end arrives late", async () => {
+      const { agent } = await runAgent([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore", prompt: "Go" },
+        taskNotification("toolu_parent", "completed"),
+        rootToolUse("toolu_send", "SendMessage", { to: "agent-42", message: "Again" }),
+        { ...taskStarted("agent-42", "toolu_send"), subagent_type: "Explore", prompt: "Again" },
+        taskNotification("toolu_parent", "completed"),
+      ]);
+
+      // The child's permission requests are still attributed to its run.
+      expect(agent.sessions["test-session"]?.liveBackgroundTasks.get("agent-42")).toMatchObject({
+        parentToolUseId: "toolu_send",
+      });
+    });
+
+    it("ignores a SendMessage result that arrives after the run it started ended", async () => {
+      const { agent, updates } = await runAgent([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore", prompt: "Go" },
+        taskNotification("toolu_parent", "completed"),
+        rootToolUse("toolu_send", "SendMessage", { to: "agent-42", message: "Again" }),
+        { ...taskStarted("agent-42", "toolu_send"), subagent_type: "Explore", prompt: "Again" },
+        taskNotification("toolu_send", "failed"),
+        {
+          type: "user",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          tool_use_result: { success: true, resumedAgentId: "agent-42" },
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_send", content: "Resumed" }],
+          },
+        },
+      ]);
+
+      expect(subagentTraffic(updates).at(-1)?.update).toMatchObject({
+        sessionUpdate: "subagent_update",
+        state: { state: "idle" },
+      });
+      expect(agent.sessions["test-session"]?.liveBackgroundTasks.has("agent-42")).toBe(false);
     });
 
     it("adds the SDK's error to a failure that a notification reported first", async () => {
