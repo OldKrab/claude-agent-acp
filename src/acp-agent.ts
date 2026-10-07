@@ -262,6 +262,7 @@ import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/c
 import { AcpToolCallRenderer, type ToolUpdateMeta } from "./tool-calls/renderer.js";
 import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
 import {
+  messageLoopYielder,
   nodeToWebReadable,
   nodeToWebWritable,
   Pushable,
@@ -4819,6 +4820,14 @@ export class ClaudeAcpAgent {
 
     try {
       while (true) {
+        // A backlog of buffered SDK messages drains without a macrotask
+        // boundary (each await resolves in a microtask), which would starve
+        // timers and incoming requests, `session/cancel` among them, until
+        // the backlog is gone. Give the event loop a turn when this stretch
+        // has run past its budget. Messages keep their order: the next one is
+        // pulled only after the pause.
+        const pause = messageLoopYielder.maybeYield();
+        if (pause) await pause;
         pendingNext ??= session.query
           .next()
           .then((result) => ({ kind: "message" as const, result }));
