@@ -7,8 +7,9 @@ keeps a single release PR open, titled `chore(main): release openaide-claude-age
 and labelled `autorelease: pending`.
 
 Merging that PR is what releases. It tags `openaide-claude-agent-acp-vX.Y.Z`,
-creates the GitHub release, runs the verification suite, and publishes
-`@openaide/claude-agent-acp` to npm.
+creates the GitHub release, runs the verification suite, publishes
+`@openaide/claude-agent-acp` to npm, and asks OpenAIDE to open the pull request
+that pins the new version.
 
 There is no manual release button, and versions are never typed in by hand: the
 version is an output of the commit history, not an input. There is no preview
@@ -22,6 +23,10 @@ release-please only releases what lands after its manifest version, so the first
 ```sh
 gh workflow run publish.yml --ref main -f ref=main
 ```
+
+The bootstrap run's `trigger-openaide-update` job fails if OpenAIDE's `main` does
+not have `update-claude-acp.yml` yet; the OpenAIDE change that adds it also pins
+`1.0.0`, so nothing is lost.
 
 That publish authenticates with the repository's encrypted `NPM_TOKEN` secret.
 After the package exists, configure npm Trusted Publishing for
@@ -134,6 +139,18 @@ gh workflow run publish.yml --ref main -f ref="openaide-claude-agent-acp-v<versi
 This re-runs `verify` against that ref before publishing. npm versions are
 immutable, so a version that already published cannot be published again.
 
+### npm published but OpenAIDE was not asked to update
+
+`trigger-openaide-update` waits until the exact version resolves on npm, then
+dispatches `update-claude-acp.yml` in `OldKrab/OpenAIDE`. Re-run that failed job
+alone, or dispatch the OpenAIDE workflow directly:
+
+```sh
+gh workflow run update-claude-acp.yml --repo OldKrab/OpenAIDE --ref main -f version=<version>
+```
+
+OpenAIDE also runs that workflow daily, so a lost dispatch only delays the pin.
+
 ## Upstream updates
 
 `upstream-sync.yml` checks the latest `agentclientprotocol/claude-agent-acp`
@@ -155,7 +172,7 @@ the next upstream release gets its own PR.
 
 | Secret                                             | Used for                                                          |
 | -------------------------------------------------- | ----------------------------------------------------------------- |
-| `RELEASE_APP_CLIENT_ID`, `RELEASE_APP_PRIVATE_KEY` | App token for release PRs and tags, so they can trigger workflows |
+| `RELEASE_APP_CLIENT_ID`, `RELEASE_APP_PRIVATE_KEY` | App token for release PRs and tags, and the OpenAIDE pin dispatch |
 | `NPM_TOKEN`                                        | npm publishing until Trusted Publishing is configured             |
 
 The release-please and publish jobs run in the `release` environment.
@@ -163,4 +180,5 @@ The release-please and publish jobs run in the `release` environment.
 The release GitHub App must be installed on this repository with `Contents:
 write`, `Pull requests: write`, and `Workflows: write` permissions. The workflow
 permission is required because an upstream release commit can update files under
-`.github/workflows`.
+`.github/workflows`. Its installation on `OldKrab/OpenAIDE` needs `Actions:
+write` so the publish workflow can dispatch the pin update there.

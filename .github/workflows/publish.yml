@@ -83,6 +83,8 @@ jobs:
     permissions:
       contents: read
       id-token: write # npm trusted publishing after the bootstrap release
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -97,6 +99,78 @@ jobs:
       # npm Trusted Publishing for this workflow and remove the secret; OIDC then
       # authenticates later releases without a long-lived publish token.
       # prepublishOnly builds the package.
-      - run: npm publish --access public
+      - name: Publish
+        id: publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          npm publish --access public
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # The fork's counterpart of upstream's agent registry update: OpenAIDE pins one
+  # exact adapter version, so each publish asks it to open the pin update PR.
+  trigger-openaide-update:
+    name: Request the OpenAIDE pin update
+    needs: publish-npm
+    if: ${{ always() && needs.publish-npm.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions: {}
+    # npm metadata is normally visible within about five minutes. Leave 2.5x that
+    # window for propagation, plus enough time to mint the token and dispatch.
+    timeout-minutes: 15
+    steps:
+      - name: Wait for package to become available
+        env:
+          PACKAGE: "@openaide/claude-agent-acp"
+          VERSION: ${{ needs.publish-npm.outputs.version }}
+        run: |
+          if [ -z "$VERSION" ]; then
+            echo "::error::The publish job did not report a package version."
+            exit 1
+          fi
+
+          deadline=$((SECONDS + 750))
+          while (( SECONDS < deadline )); do
+            if timeout 10s npm pack "$PACKAGE@$VERSION" \
+              --dry-run \
+              --ignore-scripts \
+              --silent \
+              --registry=https://registry.npmjs.org \
+              --prefer-online \
+              --fetch-retries=0 >/dev/null 2>&1; then
+              echo "$PACKAGE@$VERSION is available from npm."
+              exit 0
+            fi
+
+            remaining=$((deadline - SECONDS))
+            if (( remaining > 0 )); then
+              echo "Waiting for $PACKAGE@$VERSION to become available (${remaining}s remaining)..."
+              sleep 10
+            fi
+          done
+
+          echo "::error::$PACKAGE@$VERSION was not available from npm after 12.5 minutes."
+          exit 1
+
+      # The shared release App is also installed on OpenAIDE; scope the token to
+      # that repository and inherit the installation's permission policy.
+      - name: Generate token scoped to OpenAIDE
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        id: openaide-token
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: OpenAIDE
+
+      - name: Dispatch the pin update
+        env:
+          GH_TOKEN: ${{ steps.openaide-token.outputs.token }}
+          VERSION: ${{ needs.publish-npm.outputs.version }}
+        run: |
+          gh workflow run update-claude-acp.yml \
+            --repo "${{ github.repository_owner }}/OpenAIDE" \
+            --ref main \
+            -f version="$VERSION"
