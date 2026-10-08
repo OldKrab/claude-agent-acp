@@ -1,0 +1,192 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: agentclientprotocol/claude-agent-acp
+
+jobs:
+  open-update:
+    name: Open an upstream release PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate repository token
+        id: repository-token
+        # Match the other release workflows: the shared App installation owns
+        # its permission policy, and rejects a separately narrowed token request.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      # App-authored pull requests trigger the ordinary pull_request CI workflow.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ steps.repository-token.outputs.token }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "lts/*"
+
+      - name: Find the latest upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ steps.repository-token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Unexpected upstream release tag: $tag" >&2
+            exit 1
+          fi
+
+          branch="shushakov/sync-upstream-${tag}"
+          tracked="$(jq -r '.openaideUpstream // empty' package.json)"
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+          if [[ "$tracked" == "${UPSTREAM_REPOSITORY}@${tag}" ]]; then
+            echo "The fork already records ${UPSTREAM_REPOSITORY}@${tag}"
+            echo "required=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Fetch only the immutable release tag. The namespaced ref cannot
+          # collide with the fork's independent release tags.
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPOSITORY}.git" \
+            "refs/tags/${tag}:refs/upstream-releases/${tag}"
+          commit="$(git rev-parse "refs/upstream-releases/${tag}^{commit}")"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$commit" HEAD; then
+            echo "Upstream ${tag} is already in the fork history"
+            echo "required=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "required=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release branch
+        if: steps.release.outputs.required == 'true'
+        id: publish-branch
+        env:
+          BRANCH: ${{ steps.release.outputs.branch }}
+          GH_TOKEN: ${{ steps.repository-token.outputs.token }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+          TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          existing_pr="$(gh pr list --head "$BRANCH" --state all --json number,state --jq '.[0] // empty')"
+          if [[ -n "$existing_pr" && "$(jq -r .state <<< "$existing_pr")" != "OPEN" ]]; then
+            echo "A closed pull request already tracks this release; respecting that decision"
+            exit 0
+          fi
+          fork_head="$(git rev-parse HEAD)"
+          remote_commit="$(git ls-remote --heads origin "refs/heads/${BRANCH}" | cut -f1)"
+          if [[ -n "$remote_commit" && "$remote_commit" != "$RELEASE_COMMIT" ]]; then
+            git fetch --no-tags origin "refs/heads/${BRANCH}:refs/remotes/origin/upstream-update"
+            prepared_release="$(git show -s --format='%(trailers:key=Upstream-Sync-Release,valueonly)' "$remote_commit")"
+            prepared_base="$(git show -s --format='%(trailers:key=Upstream-Sync-Base,valueonly)' "$remote_commit")"
+            committer="$(git show -s --format=%ce "$remote_commit")"
+            if [[ "$prepared_release" != "$RELEASE_COMMIT" || -z "$prepared_base" || "$committer" != 'github-actions[bot]@users.noreply.github.com' ]]; then
+              echo "Preserving a branch with maintainer edits"
+              exit 0
+            fi
+            if [[ "$prepared_base" == "$fork_head" && -n "$existing_pr" ]]; then
+              echo "The update PR already includes the current main"
+              exit 0
+            fi
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          result=0
+          node scripts/prepare-upstream-sync.mjs \
+            --release "$RELEASE_COMMIT" \
+            --tag "$TAG" \
+            --branch "$BRANCH" || result=$?
+
+          if [[ "$result" == "2" ]]; then
+            echo "draft=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Upstream conflicts need maintainer resolution; the update will be a draft PR"
+            # Preserve an existing prepared branch. For a new conflict, the raw
+            # release makes GitHub show the real conflicts without committing markers.
+            if [[ -z "$remote_commit" ]]; then
+              git switch --detach "$RELEASE_COMMIT"
+            fi
+          elif [[ "$result" != "0" ]]; then
+            exit "$result"
+          else
+            echo "draft=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ "$result" == "0" || -z "$remote_commit" ]]; then
+            # Only a branch with our preparation trailers is regenerated. The
+            # exact lease also protects edits arriving during this run.
+            git push --force-with-lease="refs/heads/${BRANCH}:${remote_commit}" \
+              origin "HEAD:refs/heads/${BRANCH}"
+          fi
+          if [[ -n "$existing_pr" ]]; then
+            echo "existing_pr=$(jq -r .number <<< "$existing_pr")" >> "$GITHUB_OUTPUT"
+          fi
+          echo "update_pr=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or refresh the update pull request
+        if: steps.publish-branch.outputs.update_pr == 'true'
+        env:
+          BRANCH: ${{ steps.release.outputs.branch }}
+          GH_TOKEN: ${{ steps.repository-token.outputs.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          DRAFT: ${{ steps.publish-branch.outputs.draft }}
+          EXISTING_PR: ${{ steps.publish-branch.outputs.existing_pr }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$EXISTING_PR" ]]; then
+            current_draft="$(gh pr view "$EXISTING_PR" --json isDraft --jq .isDraft)"
+            if [[ "$DRAFT" == "true" && "$current_draft" != "true" ]]; then
+              gh pr ready "$EXISTING_PR" --undo
+            elif [[ "$DRAFT" != "true" && "$current_draft" == "true" ]]; then
+              gh pr ready "$EXISTING_PR"
+            fi
+            exit 0
+          fi
+
+          body="$(mktemp)"
+          trap 'rm -f "$body"' EXIT
+          cat > "$body" <<EOF
+          Tracks the exact [upstream ${TAG} release](https://github.com/${UPSTREAM_REPOSITORY}/releases/tag/${TAG}).
+
+          The daily sync prepares the immutable upstream release against current main, preserving the \`@openaide/claude-agent-acp\` package identity and fork-owned release files. Automation refreshes its own branch as main advances and stops rewriting it after maintainer commits.
+
+          A draft means source or dependency conflicts need manual resolution. Its branch may point at the raw upstream release: resolve the conflicts and preserve the fork package identity and release files before marking ready. A closed PR suppresses recreation for that tag.
+
+          The normal pull-request CI suite validates prepared merges. Review the release impact and use a release-triggering conventional title before merging when a package release is intended.
+          EOF
+
+          draft_args=()
+          if [[ "$DRAFT" == "true" ]]; then draft_args+=(--draft); fi
+          gh pr create \
+            "${draft_args[@]}" \
+            --base main \
+            --head "$BRANCH" \
+            --title "chore: sync upstream ${TAG}" \
+            --body-file "$body"

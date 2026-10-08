@@ -615,9 +615,13 @@ async function settle() {
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
 /** The version of this adapter in `package.json`, which `agentInfo` reports. */
-const PACKAGE_VERSION: string = JSON.parse(
+const PACKAGE: { name: string; version: string } = JSON.parse(
   fs.readFileSync(new URL("../../../package.json", import.meta.url), "utf8"),
-).version;
+);
+const PACKAGE_VERSION = PACKAGE.version;
+// The recordings stay byte-identical to upstream, so they merge without
+// conflicts. The fork reports its own package name; map it back here.
+const UPSTREAM_PACKAGE_NAME = "@agentclientprotocol/claude-agent-acp";
 
 /** The ids that `randomUUID` of `node:crypto` generated during the active run. */
 const generatedIds = new Set<string>();
@@ -661,6 +665,7 @@ export function normalize(
       // the machine. Any other command stays as it is, so a recording shows it.
       if (key === "command" && node === process.execPath) return "<executable>";
       if (key === "version" && node === PACKAGE_VERSION) return "<version>";
+      if (key === "name" && node === PACKAGE.name) return UPSTREAM_PACKAGE_NAME;
       const text = node.split(cwd).join("<cwd>").split(home).join("<home>");
       return text.replace(UUID, (id) => {
         if (!ids.has(id)) {
