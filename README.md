@@ -1,6 +1,6 @@
 # ACP adapter for the Claude Agent SDK
 
-[![npm](https://img.shields.io/npm/v/%40agentclientprotocol%2Fclaude-agent-acp)](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp)
+[![npm](https://img.shields.io/npm/v/%40openaide%2Fclaude-agent-acp)](https://www.npmjs.com/package/@openaide/claude-agent-acp)
 
 Use [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview#branding-guidelines) from [ACP-compatible](https://agentclientprotocol.com) clients!
 
@@ -27,12 +27,12 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
-To try changes that have landed on `main` but are not released yet, install from the
-`preview` channel — every push to `main` publishes one. See
-[`docs/RELEASES.md`](docs/RELEASES.md#preview-releases).
+This is the OpenAIDE-maintained build of
+[`agentclientprotocol/claude-agent-acp`](https://github.com/agentclientprotocol/claude-agent-acp),
+published as `@openaide/claude-agent-acp` with its own version line:
 
 ```sh
-npm install @agentclientprotocol/claude-agent-acp@preview
+npx -y @openaide/claude-agent-acp
 ```
 
 ### Subagent sessions

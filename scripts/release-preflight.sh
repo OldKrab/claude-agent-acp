@@ -13,6 +13,8 @@
 set -euo pipefail
 
 PENDING_LABEL="autorelease: pending"
+# The check that must be green on the release PR: the job name in ci.yml.
+REQUIRED_CHECK="Build"
 
 fail() {
   printf 'FAIL  %s\n' "$1" >&2
@@ -85,34 +87,41 @@ if [ "$title_version" != "$pkg_version" ] || [ "$title_version" != "$manifest_ve
 fi
 pass "version agrees across PR title, package.json and manifest: $title_version"
 
-# The tag comes from the config, not from the PR title. With
-# include-component-in-tag left on, release-please tags <component>-vX.Y.Z, which
-# breaks the vX.Y.Z scheme the rest of this script and docs/RELEASES.md rely on,
-# and makes it rewrite the whole history into the changelog because no tag under
-# that scheme exists yet. The compare link it writes into the PR body names the
-# tags it is going to use, so check those rather than trusting the config.
+# The tag comes from the release PR's config, not from its title. Read that same
+# config so the preflight follows either the upstream vX.Y.Z namespace or this
+# fork's component-prefixed namespace without duplicating release policy here.
+component=$(gh api "repos/$repo/contents/release-please-config.json?ref=$head_ref" \
+  -H "Accept: application/vnd.github.raw" --jq '.packages["."].component // ""')
+include_component=$(gh api "repos/$repo/contents/release-please-config.json?ref=$head_ref" \
+  -H "Accept: application/vnd.github.raw" --jq \
+  '.packages["."]."include-component-in-tag" // ."include-component-in-tag" // false')
+if [ "$include_component" = "true" ]; then
+  [ -n "$component" ] || fail "release config includes the component in tags but defines no component."
+  expected_tag="$component-v$title_version"
+else
+  expected_tag="v$title_version"
+fi
+
+# The compare link is release-please's declaration of the tag it will create.
 compare_tag=$(gh pr view "$pr_number" --repo "$repo" --json body --jq '
   .body | capture("/compare/[^)]*[.][.][.](?<to>[^)\\s]+)").to // ""' 2>/dev/null || true)
 case $compare_tag in
-"" | "v$title_version") ;;
-*) fail "release-please is going to tag '$compare_tag', not 'v$title_version'.
-      Every previous release is tagged vX.Y.Z, and the changelog for #$pr_number
-      covers the whole history rather than just this release, because no tag
-      under that scheme exists. Set 'include-component-in-tag': false in
-      release-please-config.json, then let it rewrite the release PR." ;;
+"" | "$expected_tag") ;;
+*) fail "release-please is going to tag '$compare_tag', not '$expected_tag'.
+      Check release-please-config.json and let release-please rewrite the PR." ;;
 esac
 
-if gh release view "v$title_version" --repo "$repo" >/dev/null 2>&1; then
-  fail "tag v$title_version already exists. Merging would try to release it twice."
+if gh release view "$expected_tag" --repo "$repo" >/dev/null 2>&1; then
+  fail "tag $expected_tag already exists. Merging would try to release it twice."
 fi
-pass "tag v$title_version does not exist yet"
+pass "tag $expected_tag does not exist yet"
 
-build=$(gh pr view "$pr_number" --repo "$repo" --json statusCheckRollup --jq '
-  [.statusCheckRollup[]? | select(.name == "Build")]
-  | if length == 0 then "MISSING" else (.[0].conclusion // .[0].status // "PENDING") end')
+build=$(gh pr view "$pr_number" --repo "$repo" --json statusCheckRollup --jq "
+  [.statusCheckRollup[]? | select(.name == \"$REQUIRED_CHECK\")]
+  | if length == 0 then \"MISSING\" else (.[0].conclusion // .[0].status // \"PENDING\") end")
 [ "$build" = "SUCCESS" ] ||
-  fail "required check 'Build' is $build on #$pr_number, expected SUCCESS."
-pass "required check 'Build' passed"
+  fail "required check '$REQUIRED_CHECK' is $build on #$pr_number, expected SUCCESS."
+pass "required check '$REQUIRED_CHECK' passed"
 
 cat <<EOF
 
@@ -120,5 +129,5 @@ Ready to release $title_version.
 
   gh pr merge $pr_number --squash
 
-Merging tags v$title_version, publishes to npm and updates the agent registry.
+Merging tags $expected_tag and publishes to npm.
 EOF

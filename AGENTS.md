@@ -36,7 +36,7 @@ patch, and `chore:`/`ci:`/`test:` and friends do not release at all.
 
 ## Releasing
 
-Stable releases are fully automated by release-please. There is no manual release
+Releases are fully automated by release-please. There is no manual release
 workflow, and the version is never chosen by hand — it follows from the commit
 history.
 
@@ -48,9 +48,7 @@ gh pr merge <pr-number> --squash
 The preflight is the guard-list as code; if it exits non-zero, follow what it
 prints rather than merging.
 
-Every _other_ push to `main` publishes a preview to npm — `0.73.1-preview.4` and
-so on — under the `preview` dist-tag, tags the commit it came from, and updates
-the agent registry the same way a release does. Only `latest` is reserved for
-real releases. So anything merged to `main` is published within minutes; there is
-no staging branch. Full runbook, including how to recover a stalled release:
+The package is `@openaide/claude-agent-acp`, versioned independently of upstream
+and tagged `openaide-claude-agent-acp-vX.Y.Z`. `upstream-sync.yml` opens one PR
+per upstream release. Full runbook, including how to recover a stalled release:
 [`docs/RELEASES.md`](docs/RELEASES.md).
