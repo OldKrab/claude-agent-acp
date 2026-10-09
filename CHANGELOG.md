@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.0.0...openaide-claude-agent-acp-v1.1.0) (2026-10-09)
+
+
+### Features
+
+* report background work to clients without AIR ([#3](https://github.com/OldKrab/claude-agent-acp/issues/3)) ([965ff9f](https://github.com/OldKrab/claude-agent-acp/commit/965ff9f203d30649fada77b9f57d70faa13b5ad2))
+
 ## [0.88.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.87.0...v0.88.0) (2026-10-08)
 
 
