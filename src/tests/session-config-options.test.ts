@@ -1257,6 +1257,78 @@ describe("session config options", () => {
     });
   });
 
+  describe("context usage before the first turn", () => {
+    beforeEach(() => {
+      populateSession();
+    });
+
+    function getSession() {
+      return (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+    }
+
+    function refresh() {
+      (
+        agent as unknown as {
+          refreshContextWindowInBackground: (sessionId: string, session: unknown) => void;
+        }
+      ).refreshContextWindowInBackground(SESSION_ID, getSession());
+    }
+
+    function usageUpdates() {
+      return sessionUpdates
+        .map((n) => n.update)
+        .filter((update) => update.sessionUpdate === "usage_update");
+    }
+
+    it("reports the background read as the first context reading", async () => {
+      const session = getSession();
+      session.contextUsedTokens = undefined;
+      session.contextWindowSize = 1_000_000;
+      session.query.getContextUsage = vi.fn(async () => ({
+        rawMaxTokens: 300_000,
+        totalTokens: 12_035,
+      }));
+
+      refresh();
+
+      // The size is the window the session compacts at, not the model's.
+      await vi.waitFor(() =>
+        expect(usageUpdates()).toEqual([
+          { sessionUpdate: "usage_update", used: 12_035, size: 300_000 },
+        ]),
+      );
+      // Only a turn's reading is kept, so a later turn always replaces this.
+      expect(session.contextUsedTokens).toBeUndefined();
+    });
+
+    it("does not replace a reading a turn already reported", async () => {
+      const session = getSession();
+      session.contextUsedTokens = 48_000;
+      session.query.getContextUsage = vi.fn(async () => ({
+        rawMaxTokens: 300_000,
+        totalTokens: 12_035,
+      }));
+
+      refresh();
+      await vi.waitFor(() => expect(session.autoCompactWindow).toBe(300_000));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(usageUpdates()).toEqual([]);
+    });
+
+    it("reports nothing when the read carries no token count", async () => {
+      const session = getSession();
+      session.contextUsedTokens = undefined;
+      session.query.getContextUsage = vi.fn(async () => ({ rawMaxTokens: 300_000 }));
+
+      refresh();
+      await vi.waitFor(() => expect(session.autoCompactWindow).toBe(300_000));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(usageUpdates()).toEqual([]);
+    });
+  });
+
   describe("auto mode availability per model", () => {
     /**
      * Augment the session populated by `populateSession()` with a Haiku entry

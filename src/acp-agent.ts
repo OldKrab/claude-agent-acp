@@ -9023,6 +9023,9 @@ export class ClaudeAcpAgent {
    * `rawMaxTokens` is the only source of the compaction window
    * (`session.autoCompactWindow`): the cache and `result.modelUsage` carry the
    * model's window only.
+   *
+   * The same read carries `totalTokens`, which becomes the session's first
+   * context reading (see `reportContextBeforeFirstTurn`).
    */
   private refreshContextWindowInBackground(sessionId: string, session: Session): void {
     const { query } = session;
@@ -9042,14 +9045,48 @@ export class ClaudeAcpAgent {
           // mid-session change to the setting shows up only on the next model
           // switch or session load.
           session.autoCompactWindow = usage.rawMaxTokens;
-          if (session.contextWindowAuthoritative) return;
-          session.contextWindowSize = usage.rawMaxTokens;
-          session.contextWindowAuthoritative = true;
+          if (!session.contextWindowAuthoritative) {
+            session.contextWindowSize = usage.rawMaxTokens;
+            session.contextWindowAuthoritative = true;
+          }
+          return this.reportContextBeforeFirstTurn(sessionId, session, usage.totalTokens);
         },
         (error) => {
           if (stillCurrent()) this.logger.error("Failed to read the context window:", error);
         },
       );
+  }
+
+  /**
+   * Tell the client how full the context is before any turn has reported it.
+   * A turn's first `usage_update` comes only once the model answers, so
+   * without this a new or resumed session shows no context reading until the
+   * user sends a message. `used` is the CLI's local estimate from the
+   * `summary` read (system prompt, tools, memory, skills, and the transcript
+   * of a resumed session); the first turn replaces it with the API's count.
+   *
+   * Skipped once a turn has reported usage: `contextUsedTokens` is then the
+   * newer and exact value. It is left unset here, so a model switch before the
+   * first prompt reports again with the new window.
+   */
+  private async reportContextBeforeFirstTurn(
+    sessionId: string,
+    session: Session,
+    usedTokens: number,
+  ): Promise<void> {
+    if (session.contextUsedTokens !== undefined || !(usedTokens > 0)) return;
+    try {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          used: usedTokens,
+          size: reportedContextWindow(session),
+        },
+      });
+    } catch (error) {
+      this.logger.error("Failed to report the context usage before the first turn:", error);
+    }
   }
 
   private async applyConfigOptionValue(
