@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.1.0...openaide-claude-agent-acp-v1.2.0) (2026-10-09)
+
+
+### Features
+
+* report account limits after each turn ([#7](https://github.com/OldKrab/claude-agent-acp/issues/7)) ([0f6317a](https://github.com/OldKrab/claude-agent-acp/commit/0f6317adc31d64b56ade0d6735f96df097dcce9c))
+
+
+### Bug Fixes
+
+* keep Agent tool results out of the parent session and report subagent metadata ([#5](https://github.com/OldKrab/claude-agent-acp/issues/5)) ([df472df](https://github.com/OldKrab/claude-agent-acp/commit/df472df3ec0d05cd534c570c0c4afee98405786b))
+
 ## [1.1.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.0.0...openaide-claude-agent-acp-v1.1.0) (2026-10-09)
 
 
