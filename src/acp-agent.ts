@@ -6695,7 +6695,10 @@ export class ClaudeAcpAgent {
               message,
               params.sessionId,
               session.toolUseCache,
-              this.client,
+              // A PostToolUse hook that a stream chunk registers publishes
+              // through this client. It must take the same route as the tool
+              // call: an Agent or Task result must not reach the root session.
+              routedNotificationClient,
               this.logger,
               {
                 clientCapabilities: this.clientCapabilities,
@@ -6863,6 +6866,9 @@ export class ClaudeAcpAgent {
             // model responses, so they must not erase the last real context
             // measurement. A turn with no real frame leaves the snapshot null
             // and the result emits no usage_update, keeping the client's value.
+            if (message.type === "assistant" && message.parent_tool_use_id) {
+              await subagents.modelObserved(message.parent_tool_use_id, message.message.model);
+            }
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
               if (message.message.model !== "<synthetic>") {
                 lastAssistantUsage = snapshotFromUsage(message.message.usage);

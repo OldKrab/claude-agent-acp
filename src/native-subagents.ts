@@ -12,6 +12,12 @@ export type NativeSubagent = {
    * `subagent_spawned`. It is absent when the adapter has no prompt.
    */
   prompt?: string;
+  /** The `subagent_type` of the Agent or Task call, for example `Explore`. */
+  subagentType?: string;
+  /** The `model` argument of the Agent or Task call, for example `sonnet`. */
+  requestedModel?: string;
+  /** The model id of the child's own assistant messages. */
+  model?: string;
   announced?: boolean;
   terminalState?: SubagentState;
   /** Connection-local single-flight state; never serialized on the wire. */
@@ -42,6 +48,7 @@ type SubagentIdentity = {
   description?: string;
   prompt?: string;
   subagentType?: string;
+  model?: string;
 };
 
 const MAX_PENDING_PARENTS = 64;
@@ -170,6 +177,28 @@ export class NativeSubagentRuntime {
     return notification;
   }
 
+  /**
+   * Records the model of an assistant message that the child of
+   * `parentToolUseId` produced. The announcement cannot carry it, because the
+   * SDK names the model only on the child's messages. The first message, and a
+   * later model change, send a `session_info_update` on the child session.
+   */
+  async modelObserved(parentToolUseId: string, model: unknown): Promise<void> {
+    if (!this.enabled) return;
+    const resolved = nonBlankString(model);
+    // `<synthetic>` marks text the CLI wrote itself, not a model answer.
+    if (!resolved || resolved === "<synthetic>") return;
+    const child = this.childByParentToolUse.get(parentToolUseId);
+    if (!child || child.model === resolved) return;
+    child.model = resolved;
+    // An unannounced child carries the model in its `subagent_spawned`.
+    if (!child.announced || child.terminalState !== undefined || child.terminalPromise) return;
+    await this.publish({
+      sessionId: child.sessionId,
+      update: { sessionUpdate: "session_info_update", ...subagentMetaField(child) },
+    });
+  }
+
   async taskStarted(task: TaskStarted, deliver: Publish): Promise<void> {
     if (!this.enabled) return;
     if (!task.subagentType) {
@@ -202,11 +231,21 @@ export class NativeSubagentRuntime {
           identity?.subagentType ?? task.subagentType,
           task.taskId,
         ),
-        task: subagentDescription(
-          identity?.prompt ?? task.prompt,
-          identity?.description ?? task.description,
-        ),
+        // A resumed run has no Agent or Task input, and its `task_started`
+        // prompt is the text that woke it, for example a `<task-notification>`
+        // block. That text is this generation's `prompt`, not the delegated work.
+        task:
+          previous && !identity
+            ? previous.task
+            : subagentDescription(
+                identity?.prompt ?? task.prompt,
+                identity?.description ?? task.description,
+              ),
         ...promptField(promptText(task.prompt) ?? identity?.prompt),
+        subagentType:
+          identity?.subagentType ?? nonBlankString(task.subagentType) ?? previous?.subagentType,
+        requestedModel: identity?.model ?? previous?.requestedModel,
+        model: previous?.model,
       },
       !!knownParentSessionId || !task.toolUseId,
       deliver,
@@ -236,6 +275,9 @@ export class NativeSubagentRuntime {
         name: previous.name,
         task: previous.task,
         ...promptField(promptText(prompt)),
+        subagentType: previous.subagentType,
+        requestedModel: previous.requestedModel,
+        model: previous.model,
       },
       true,
       deliver,
@@ -438,7 +480,14 @@ export class NativeSubagentRuntime {
     previous: NativeSubagent | undefined,
     fields: Pick<
       NativeSubagent,
-      "parentSessionId" | "parentToolUseId" | "name" | "task" | "prompt"
+      | "parentSessionId"
+      | "parentToolUseId"
+      | "name"
+      | "task"
+      | "prompt"
+      | "subagentType"
+      | "requestedModel"
+      | "model"
     >,
     announce: boolean,
     deliver: Publish,
@@ -486,6 +535,7 @@ export async function announceNativeSubagent(
         task: child.task,
         ...promptField(child.prompt),
         capabilities: {},
+        ...subagentMetaField(child),
       },
     });
     child.announced = true;
@@ -713,6 +763,7 @@ function subagentIdentity(input: unknown): SubagentIdentity | undefined {
     description: nonBlankString(value.description),
     prompt: promptText(value.prompt),
     subagentType: nonBlankString(value.subagent_type),
+    model: nonBlankString(value.model),
   };
   return Object.values(identity).some(Boolean) ? identity : undefined;
 }
@@ -726,6 +777,7 @@ function mergeSubagentIdentity(
     description: next.description ?? previous?.description,
     prompt: next.prompt ?? previous?.prompt,
     subagentType: next.subagentType ?? previous?.subagentType,
+    model: next.model ?? previous?.model,
   };
 }
 
@@ -746,6 +798,24 @@ function applySubagentIdentity(
     child.task = subagentDescription(identity.prompt, identity.description);
   }
   child.prompt ??= identity.prompt;
+  child.subagentType ??= identity.subagentType;
+  child.requestedModel ??= identity.model;
+}
+
+/**
+ * `_meta.claudeCode.nativeSubagent` for a child: `type`, `requestedModel` and `model`.
+ * A field is absent when the adapter does not know it, and the whole `_meta`
+ * is absent when it knows none.
+ */
+function subagentMetaField(child: NativeSubagent): { _meta?: Record<string, unknown> } {
+  const subagent = {
+    ...(child.subagentType ? { type: child.subagentType } : {}),
+    ...(child.requestedModel ? { requestedModel: child.requestedModel } : {}),
+    ...(child.model ? { model: child.model } : {}),
+  };
+  return Object.keys(subagent).length > 0
+    ? { _meta: { claudeCode: { nativeSubagent: subagent } } }
+    : {};
 }
 
 /** The prompt text unchanged, or `undefined` when it is not a non-blank string. */
