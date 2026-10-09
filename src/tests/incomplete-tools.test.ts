@@ -226,6 +226,7 @@ function createTestSession(
         updates.push(notification.update);
       },
       requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow-once" } }),
+      extNotification: async () => {},
     } as unknown as AcpClient,
     { log: () => {}, error: logError },
   );

@@ -7898,7 +7898,7 @@ describe("stop reason propagation", () => {
       yield { type: "system", subtype: "session_state_changed", state: "idle" };
       yield { ...autonomousResult, num_turns: 0 };
       // The consumer asks for this message only after it handled the placeholder.
-      expect(extNotifications).toEqual([]);
+      expect(extNotifications.filter((n) => n.method === "_session/turn_ended")).toEqual([]);
       yield autonomousResult;
       followupSeen.push();
     }
@@ -7974,6 +7974,78 @@ describe("stop reason propagation", () => {
     });
     expect(response.stopReason).toBe("end_turn");
     expect(extNotifications.filter((n) => n.method === "_session/turn_ended")).toEqual([]);
+  });
+
+  it("reports each session state change via _session/state_changed", async () => {
+    // After the prompt response a client cannot tell from output whether
+    // Claude Code is working: a cycle it starts on its own and a line the
+    // adapter writes both arrive as out-of-turn updates.
+    const extNotifications: { method: string; params: any }[] = [];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      extNotification: async (method: string, params: any) => {
+        extNotifications.push({ method, params });
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    const input = new Pushable<any>();
+    const promptResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+    const autonomousResult = {
+      ...createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+      origin: { kind: "task-notification" },
+    };
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield { type: "system", subtype: "session_state_changed", state: "running" };
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield promptResult;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      // A stopped background command repeats `idle`; that is not a change.
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      // A background command finished and woke the model.
+      yield { type: "system", subtype: "session_state_changed", state: "running" };
+      yield autonomousResult;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+      cwd: "/tmp/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/tmp/test", mcpServers: [] }),
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+
+    const states = () =>
+      extNotifications.filter((n) => n.method === "_session/state_changed").map((n) => n.params);
+    await vi.waitFor(() => {
+      expect(states()).toHaveLength(4);
+    });
+    expect(states()).toEqual([
+      { sessionId: "test-session", state: "running" },
+      { sessionId: "test-session", state: "idle" },
+      { sessionId: "test-session", state: "running" },
+      { sessionId: "test-session", state: "idle" },
+    ]);
   });
 
   it("only reconciles Fast mode from user-driven results, not task-notification followups", async () => {
