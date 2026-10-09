@@ -120,6 +120,8 @@ import {
 } from "./native-subagents.js";
 import {
   AIR_ASYNC_TASKS_CAPABILITY,
+  AIR_CUSTOM_INSTRUCTIONS_CAPABILITY,
+  airCustomInstructions,
   AIR_DIFF_PATCH_CAPABILITY,
   AIR_PLAN_FILE_CAPABILITY,
   AIR_GOAL_KEY,
@@ -2765,6 +2767,7 @@ export class ClaudeAcpAgent {
                 AGENT_FILE_CHANGE_REPORT_CAPABILITY,
                 AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
                 AIR_ASYNC_TASKS_CAPABILITY,
+                AIR_CUSTOM_INSTRUCTIONS_CAPABILITY,
                 AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
                 AIR_DIFF_PATCH_CAPABILITY,
                 AIR_PLAN_FILE_CAPABILITY,
@@ -9421,7 +9424,11 @@ export class ClaudeAcpAgent {
       }
     }
 
-    let systemPrompt: Options["systemPrompt"] = { type: "preset", preset: "claude_code" };
+    const customInstructions = airCustomInstructions(params._meta);
+    let systemPrompt: Options["systemPrompt"] =
+      customInstructions === undefined
+        ? { type: "preset", preset: "claude_code" }
+        : { type: "preset", preset: "claude_code", append: customInstructions };
     if (params._meta?.systemPrompt) {
       const customPrompt = params._meta.systemPrompt;
       if (typeof customPrompt === "string") {
