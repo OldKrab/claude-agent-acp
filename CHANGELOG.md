@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.4.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.3.0...openaide-claude-agent-acp-v1.4.0) (2026-10-09)
+
+
+### Features
+
+* report session running and idle state to clients ([#12](https://github.com/OldKrab/claude-agent-acp/issues/12)) ([30c759f](https://github.com/OldKrab/claude-agent-acp/commit/30c759f115889b5a9af3d41da5f2bef52af16dbe))
+
+
+### Bug Fixes
+
+* report the compaction window as the context size when it is smaller ([#10](https://github.com/OldKrab/claude-agent-acp/issues/10)) ([0596728](https://github.com/OldKrab/claude-agent-acp/commit/0596728347714dcb4b9922aaa0d7955919f3c68f))
+
 ## [1.3.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.2.0...openaide-claude-agent-acp-v1.3.0) (2026-10-09)
 
 
