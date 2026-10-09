@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.4.0...openaide-claude-agent-acp-v1.5.0) (2026-10-09)
+
+
+### Features
+
+* report context usage before the first prompt ([#13](https://github.com/OldKrab/claude-agent-acp/issues/13)) ([349adef](https://github.com/OldKrab/claude-agent-acp/commit/349adef31661265725e73f2fb35f61254fe3861b))
+
 ## [1.4.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.3.0...openaide-claude-agent-acp-v1.4.0) (2026-10-09)
 
 
