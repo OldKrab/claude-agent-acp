@@ -5824,6 +5824,7 @@ describe("subagent permission attribution (issue #851)", () => {
           name: "Investigate",
           task: "Investigate",
           capabilities: {},
+          _meta: { claudeCode: { nativeSubagent: { type: "Explore" } } },
         },
         {
           sessionUpdate: "subagent_state_update",
@@ -6255,6 +6256,7 @@ describe("subagent permission attribution (issue #851)", () => {
         name: "Investigate",
         task: "Investigate",
         capabilities: {},
+        _meta: { claudeCode: { nativeSubagent: { type: "Explore" } } },
       },
       {
         sessionUpdate: "subagent_state_update",

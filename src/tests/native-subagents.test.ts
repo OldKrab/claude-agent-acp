@@ -432,6 +432,96 @@ describe("NativeSubagentRuntime lifecycle", () => {
     });
   });
 
+  describe("the subagent metadata in _meta.claudeCode.nativeSubagent", () => {
+    function runtimeWith(published: AcpSessionNotification[]): NativeSubagentRuntime {
+      return new NativeSubagentRuntime(
+        true,
+        "root",
+        {},
+        async (notification) => {
+          published.push(notification);
+        },
+        { log: () => {} },
+      );
+    }
+
+    async function launch(
+      runtime: NativeSubagentRuntime,
+      rawInput: Record<string, unknown>,
+    ): Promise<void> {
+      const call = control("tool_call", "pending");
+      await runtime.route(
+        { ...call, update: { ...call.update, rawInput } } as AcpSessionNotification,
+        async () => {},
+      );
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "agent-tool", subagentType: "Explore" },
+        async () => {},
+      );
+    }
+
+    it("announces the agent type and the requested model", async () => {
+      const published: AcpSessionNotification[] = [];
+      await launch(runtimeWith(published), {
+        description: "Investigate failure",
+        prompt: "Find the cause",
+        subagent_type: "Explore",
+        model: "sonnet",
+      });
+
+      expect(published[0].update).toMatchObject({
+        sessionUpdate: "subagent_spawned",
+        _meta: { claudeCode: { nativeSubagent: { type: "Explore", requestedModel: "sonnet" } } },
+      });
+    });
+
+    it("reports the model of the child's first assistant message once", async () => {
+      const published: AcpSessionNotification[] = [];
+      const runtime = runtimeWith(published);
+      await launch(runtime, { description: "Investigate failure", prompt: "Find the cause" });
+
+      await runtime.modelObserved("agent-tool", "<synthetic>");
+      await runtime.modelObserved("agent-tool", "claude-sonnet-5-5");
+      await runtime.modelObserved("agent-tool", "claude-sonnet-5-5");
+
+      expect(published.slice(1)).toEqual([
+        {
+          sessionId: "worker-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: {
+              claudeCode: { nativeSubagent: { type: "Explore", model: "claude-sonnet-5-5" } },
+            },
+          },
+        },
+      ]);
+    });
+
+    it("keeps the delegated task when a notification resumes the child", async () => {
+      const published: AcpSessionNotification[] = [];
+      const runtime = runtimeWith(published);
+      await launch(runtime, { description: "Investigate failure", prompt: "Find the cause" });
+      await runtime.finishTask("worker-1", "completed", async () => {});
+
+      await runtime.taskStarted(
+        {
+          taskId: "worker-1",
+          toolUseId: "agent-tool",
+          subagentType: "Explore",
+          prompt: "<task-notification>done</task-notification>",
+        },
+        async () => {},
+      );
+
+      expect(published.at(-1)!.update).toMatchObject({
+        sessionUpdate: "subagent_spawned",
+        subagentSessionId: "worker-1:generation:2",
+        task: "Find the cause",
+        prompt: "<task-notification>done</task-notification>",
+      });
+    });
+  });
+
   describe("the subagent prompt in subagent_spawned", () => {
     async function spawned(
       task: { prompt?: string },

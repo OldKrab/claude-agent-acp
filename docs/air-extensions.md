@@ -1175,6 +1175,16 @@ This section covers only the AIR bridge.
   The source is the `task_started` prompt, else the Agent or Task input `prompt`.
   A resumed generation gets the SendMessage `message` text.
   The field is absent when the adapter has no prompt. The adapter does not truncate it.
+- `subagent_spawned.task` stays the delegated work across generations.
+  A generation that a `<task-notification>` resumed carries that text only in `prompt`.
+- `subagent_spawned._meta.claudeCode.nativeSubagent` carries the facts the adapter knows about the child:
+  `type` is the `subagent_type` of the Agent or Task call, `requestedModel` is its `model` argument,
+  and `model` is the model id of the child's assistant messages.
+  A field is absent when the adapter does not know it.
+- The SDK names the model only on the child's messages, so `model` usually comes after the spawn.
+  The adapter then sends one `session_info_update` on the child session with the same `_meta` object.
+  It sends another one when the model changes.
+- An Agent or Task tool call never reaches the parent session, including the tool response of a PostToolUse hook.
 - Without either signal, Agent and Task stay ordinary tool calls. AIR gets `_meta.jetbrains.air.subagent: true` on them.
   Child interactions stay on the root session.
 - A client that uses the older `_meta["subagent-transcript"]` capability or the `forwardSubagentText` session option keeps the flat child transcript.
