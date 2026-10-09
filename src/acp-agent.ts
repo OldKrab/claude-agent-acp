@@ -5342,6 +5342,27 @@ export class ClaudeAcpAgent {
               case "session_state_changed": {
                 const previousState = session.lastSessionState;
                 session.lastSessionState = message.state;
+                if (message.state !== previousState) {
+                  // Tell the client whether Claude Code is working. After the
+                  // prompt response this is the only way to see a cycle Claude
+                  // Code starts on its own, for example when a background
+                  // command finishes: `running` at its start, `idle` at its
+                  // end. `stream_event` and `assistant` messages carry no
+                  // origin, so output alone cannot tell such a cycle from a
+                  // line the adapter writes itself. Clients that don't know
+                  // the notification ignore it; a failed send must not stop
+                  // the consumer loop.
+                  try {
+                    await this.client.extNotification?.("_session/state_changed", {
+                      sessionId: params.sessionId,
+                      state: message.state,
+                    });
+                  } catch (error) {
+                    this.logger.error(
+                      `Session ${params.sessionId}: _session/state_changed notification failed: ${error}`,
+                    );
+                  }
+                }
                 if (
                   message.state === "running" &&
                   previousState !== "running" &&

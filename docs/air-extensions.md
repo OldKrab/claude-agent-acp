@@ -864,6 +864,9 @@ Claude can run work in the background, for example a backgrounded Bash command o
 The adapter publishes that work as async tasks when the client declares `asyncTasks`.
 A client that does not use AIR opts in with `"async-tasks": true` in its client capabilities `_meta`; it receives the same updates and stop request, without any AIR key.
 Without either, the adapter sends no async task update.
+After the prompt response, Claude Code can start a cycle on its own, for example when a background command finishes.
+The adapter sends `_session/state_changed` with `sessionId` and `state` (`running`, `idle`, or `requires_action`) whenever the state changes, to every client.
+A client that keeps a turn open for background work reads it to know when such a cycle starts and ends.
 A subagent task (`local_agent`) is not an async task. Native subagent sessions report it.
 A task that a `Monitor` tool call started is not an async task either.
 Monitor streams its output to the model only, so the client gets nothing for it.
