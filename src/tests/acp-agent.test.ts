@@ -12611,7 +12611,7 @@ describe("usage_update computation", () => {
     expect(getContextUsage).not.toHaveBeenCalled();
   });
 
-  it("caches the turn's authoritative window under the resolved id and serves it on a later switch, with no getContextUsage IPC", async () => {
+  it("caches the turn's authoritative window under the resolved id and serves it on a later switch, without waiting for getContextUsage", async () => {
     // End-to-end for the cross-session context-window cache:
     //  - WRITE: a turn's result.modelUsage is the only authoritative window. The
     //    assistant message reports the BARE model id ("…-9") while modelUsage is
@@ -12619,7 +12619,9 @@ describe("usage_update computation", () => {
     //    resolved key (matched by getMatchingModelUsage), the same spelling as
     //    ModelInfo.resolvedModel — otherwise a later read never hits.
     //  - READ: switching to a picker value whose resolvedModel is that key seeds
-    //    the window synchronously from the cache, with NO getContextUsage.
+    //    the window synchronously from the cache. The background getContextUsage
+    //    still runs, but only to learn the compaction window; its answer must
+    //    not replace the cached model window.
     // 777_000 is chosen so it can only come from the cache: text inference on the
     // resolved id "…-9[1m]" would yield 1_000_000 (the "1m" token), the default
     // is 200_000, and the pre-switch sentinel is 123_456.
@@ -12659,7 +12661,8 @@ describe("usage_update computation", () => {
 
     // Now switch to a picker value that resolves to the cached id. Seed a
     // sentinel and a getContextUsage spy first: a cache miss would surface as
-    // 1_000_000 (inference on the "1m" id), and any IPC as a spy call.
+    // 1_000_000 (inference on the "1m" id), and a getContextUsage answer
+    // written over the model window as 200_000.
     const getContextUsage = vi.fn(async () => ({ rawMaxTokens: 200000 }));
     (session.query as any).getContextUsage = getContextUsage;
     session.contextWindowSize = 123_456;
@@ -12689,8 +12692,46 @@ describe("usage_update computation", () => {
       value: "probe-alias",
     });
 
-    expect(getContextUsage).not.toHaveBeenCalled();
     expect(session.contextWindowSize).toBe(777_000);
+    await vi.waitFor(() => expect(session.autoCompactWindow).toBe(200000));
+    expect(session.contextWindowSize).toBe(777_000);
+  });
+
+  it("reports the compaction window as size when it is below the model's window", async () => {
+    // With `autoCompactWindow: 300000` on a 1M model, getContextUsage answers
+    // rawMaxTokens 300000 while result.modelUsage still says 1000000. The
+    // session fills to 300000, so that is the size to report after the result.
+    const RESOLVED_ID = "claude-compactcap-probe-9[1m]";
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createAssistantMessage({ model: "claude-compactcap-probe-9" }),
+      createResultMessageWithModel({
+        modelUsage: {
+          [RESOLVED_ID]: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0,
+            contextWindow: 1_000_000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"]!;
+    session.autoCompactWindow = 300_000;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(session.contextWindowSize).toBe(1_000_000);
+    const sizes = updates
+      .filter((u: any) => u.update?.sessionUpdate === "usage_update")
+      .map((u: any) => u.update.size);
+    expect(sizes.length).toBeGreaterThan(0);
+    expect(new Set(sizes)).toEqual(new Set([300_000]));
   });
 
   it("scopes the window cache per provider: a switch on a different provider does not read another provider's window", async () => {
