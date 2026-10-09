@@ -275,6 +275,7 @@ import {
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
+import { ACCOUNT_LIMITS_META_KEY, readAccountLimits } from "./account-limits.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
@@ -1098,6 +1099,9 @@ export type Session = {
     toolUseId: string;
     toolResultSeen: boolean;
   };
+  /** The `/usage` command read usage during the current turn, so the
+   *  after-turn account limits read would only repeat it. */
+  usageReadDuringTurn?: boolean;
   pendingExitPlanContextReset?: {
     toolUseId: string;
     plan: string;
@@ -3350,7 +3354,11 @@ export class ClaudeAcpAgent {
     if (isUsageCommandText(text)) {
       return {
         startsAtActivation: true,
-        produce: (query, signal) => structuredUsageMarkdown(query, signal, this.logger),
+        produce: (query, signal) => {
+          const session = this.sessions[params.sessionId];
+          if (session) session.usageReadDuringTurn = true;
+          return structuredUsageMarkdown(query, signal, this.logger);
+        },
       };
     }
     const command = parseMcpCommand(text);
@@ -4182,6 +4190,38 @@ export class ClaudeAcpAgent {
           "_claude/model": lastAssistantModel,
         },
       };
+    };
+
+    // Plan rate limits belong to the account, not to this session, and the
+    // SDK only pushes them when a request is close to a limit. Reading them
+    // after each turn keeps the client's view current. The read never delays
+    // or fails the turn: it runs detached, and its update may arrive after
+    // the prompt response.
+    let accountLimitsRead: Promise<void> | undefined;
+    const publishAccountLimits = () => {
+      const alreadyRead = session.usageReadDuringTurn === true;
+      session.usageReadDuringTurn = false;
+      if (alreadyRead || accountLimitsRead) return;
+      const signal = session.abortController.signal;
+      accountLimitsRead = readAccountLimits(session.query, signal, this.logger)
+        .then(async (limits) => {
+          // A usage_update must carry context usage; without a reading yet
+          // there is no truthful one to send the limits on.
+          if (!limits || lastAssistantTotalUsage === null || signal.aborted) return;
+          await sendUpdate({
+            sessionId: params.sessionId,
+            update: attachUsageModel({
+              sessionUpdate: "usage_update",
+              used: lastAssistantTotalUsage,
+              size: session.contextWindowSize,
+              _meta: { [ACCOUNT_LIMITS_META_KEY]: limits },
+            }),
+          });
+        })
+        .catch((error) => this.logger.error(`Account limits update failed: ${error}`))
+        .finally(() => {
+          accountLimitsRead = undefined;
+        });
     };
 
     const internalErrorForClient = (data: unknown, rawDetail?: string) =>
@@ -6122,6 +6162,7 @@ export class ClaudeAcpAgent {
                   }),
                 });
               }
+              publishAccountLimits();
 
               if (session.cancelled) {
                 session.pendingExitPlanModeInterruption = undefined;

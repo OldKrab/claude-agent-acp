@@ -2258,6 +2258,114 @@ describe("usage Markdown", () => {
     expect(text).not.toContain("Raw Claude Code usage output");
   });
 
+  const modelTurn = (agent: ClaudeAcpAgent) =>
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const user = await input[Symbol.asyncIterator]().next();
+        yield userEcho(user.value);
+        yield {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            id: "model-reply",
+            type: "message",
+            role: "assistant",
+            model: "claude-opus-4-1",
+            content: [{ type: "text", text: "Done" }],
+            stop_reason: "end_turn",
+            usage: {
+              input_tokens: 1_000,
+              output_tokens: 20,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        };
+        yield successfulResultMessage();
+      }
+      return messages();
+    });
+
+  const accountLimitsUpdates = (updates: SessionNotification[]) =>
+    updates.filter(
+      (update) =>
+        update.update.sessionUpdate === "usage_update" &&
+        update.update._meta?.["_claude/accountLimits"] !== undefined,
+    );
+
+  it("publishes the account limits after a turn without delaying its response", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    modelTurn(agent);
+    let release: (value: typeof usageResponse) => void = () => {};
+    const getUsage = vi.fn(
+      () => new Promise<typeof usageResponse>((resolve) => (release = resolve)),
+    );
+    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+      getUsage as never;
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "hello" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(getUsage).toHaveBeenCalledOnce();
+    expect(accountLimitsUpdates(updates)).toHaveLength(0);
+
+    release(usageResponse);
+    await vi.waitFor(() => expect(accountLimitsUpdates(updates)).toHaveLength(1));
+    const update = accountLimitsUpdates(updates)[0]!.update as any;
+    expect(update.used).toBeGreaterThan(0);
+    expect(update._meta["_claude/accountLimits"]).toEqual({
+      subscriptionType: "max",
+      windows: [
+        { type: "five_hour", utilization: 3, resetsAt: "2026-09-04T16:59:00.000Z" },
+        { type: "seven_day", utilization: 0, resetsAt: "2026-09-04T17:59:00.000Z" },
+        { type: "seven_day_model", model: "Fable", utilization: 0, resetsAt: null },
+      ],
+    });
+  });
+
+  it("publishes no account limits when the read fails or plan limits do not apply", async () => {
+    for (const getUsage of [
+      vi.fn(async () => {
+        throw new Error("control request failed");
+      }),
+      vi.fn(async () => ({ ...usageResponse, rate_limits_available: false, rate_limits: null })),
+    ]) {
+      const updates: SessionNotification[] = [];
+      const errors: unknown[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+        } as unknown as AcpClient,
+        { log: () => {}, error: (...args: unknown[]) => errors.push(args) },
+      );
+      modelTurn(agent);
+      agent.sessions[
+        "test-session"
+      ].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = getUsage as never;
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "hello" }],
+      });
+      await vi.waitFor(() => expect(getUsage.mock.settledResults).toHaveLength(1));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(accountLimitsUpdates(updates)).toHaveLength(0);
+    }
+  });
+
   it("does not append usage Markdown to a model-generated /usage result", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
