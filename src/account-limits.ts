@@ -3,8 +3,12 @@ import { parseUsageResponse } from "./usage-markdown.js";
 import type { Logger } from "./acp-agent.js";
 import { raceTimeoutAndAbort } from "./utils.js";
 
-/** `_meta` key of a `usage_update` that carries {@link AccountLimits}. */
-export const ACCOUNT_LIMITS_META_KEY = "_claude/accountLimits";
+/** Notification that pushes {@link AccountLimits} to the client. The limits
+ *  belong to the account, so they travel on the connection, not on a session. */
+export const ACCOUNT_LIMITS_UPDATE_METHOD = "_claude/accountLimits";
+
+/** Request that reads {@link AccountLimits} on demand; it needs no session. */
+export const ACCOUNT_LIMITS_READ_METHOD = "_claude/accountLimits/read";
 
 const ACCOUNT_LIMITS_TIMEOUT_MS = 5_000;
 
@@ -25,6 +29,10 @@ export type AccountLimits = {
   subscriptionType: string | null;
   windows: AccountLimitWindow[];
 };
+
+/** Answer to {@link ACCOUNT_LIMITS_READ_METHOD} and payload of
+ *  {@link ACCOUNT_LIMITS_UPDATE_METHOD}. */
+export type AccountLimitsReadResponse = { accountLimits: AccountLimits | null };
 
 /** Null when plan rate limits do not apply (API key, Bedrock, Vertex). */
 export function accountLimitsFromUsage(usage: SDKControlGetUsageResponse): AccountLimits | null {
@@ -85,5 +93,42 @@ export async function readAccountLimits(
   } catch (error) {
     logger.error(`Account limits read failed: ${error}`);
     return null;
+  }
+}
+
+/**
+ * Reads the plan windows when no session is open, through a query that never
+ * runs a turn: it spawns the CLI, answers the usage control request and is
+ * closed. `openQuery` receives the prompt stream that keeps the query idle.
+ */
+export async function readAccountLimitsWithoutSession(
+  openQuery: (prompt: AsyncIterable<never>) => Promise<Query>,
+  logger: Logger,
+): Promise<AccountLimits | null> {
+  let release: () => void = () => {};
+  const idle = new Promise<void>((resolve) => (release = resolve));
+  // Never yields a message: it only ends, once the read is over.
+  const prompt: AsyncIterable<never> = {
+    [Symbol.asyncIterator]: () => ({
+      next: async () => {
+        await idle;
+        return { done: true, value: undefined };
+      },
+    }),
+  };
+  let query: Query | undefined;
+  try {
+    query = await openQuery(prompt);
+    return await readAccountLimits(query, new AbortController().signal, logger);
+  } catch (error) {
+    logger.error(`Account limits read could not start: ${error}`);
+    return null;
+  } finally {
+    release();
+    try {
+      query?.close();
+    } catch (error) {
+      logger.error(`Account limits query did not close: ${error}`);
+    }
   }
 }

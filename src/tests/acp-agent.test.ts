@@ -38,6 +38,7 @@ import {
   isSyntheticLoginMessage,
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
+  v1AgentApp,
   claudeCliPath,
   computeSessionFingerprint,
   streamEventToAcpNotifications,
@@ -2288,21 +2289,33 @@ describe("usage Markdown", () => {
       return messages();
     });
 
-  const accountLimitsUpdates = (updates: SessionNotification[]) =>
-    updates.filter(
-      (update) =>
-        update.update.sessionUpdate === "usage_update" &&
-        update.update._meta?.["_claude/accountLimits"] !== undefined,
-    );
+  const expectedAccountLimits = {
+    subscriptionType: "max",
+    windows: [
+      { type: "five_hour", utilization: 3, resetsAt: "2026-09-04T16:59:00.000Z" },
+      { type: "seven_day", utilization: 0, resetsAt: "2026-09-04T17:59:00.000Z" },
+      { type: "seven_day_model", model: "Fable", utilization: 0, resetsAt: null },
+    ],
+  };
+
+  /** A client that records session updates and extension notifications. */
+  const recordingClient = () => {
+    const updates: SessionNotification[] = [];
+    const notifications: { method: string; params: Record<string, unknown> }[] = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      extNotification: async (method: string, params: Record<string, unknown>) => {
+        notifications.push({ method, params });
+      },
+    } as unknown as AcpClient;
+    const accountLimits = () =>
+      notifications.filter((notification) => notification.method === "_claude/accountLimits");
+    return { client, updates, accountLimits };
+  };
 
   it("publishes the account limits after a turn without delaying its response", async () => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
+    const { client, updates, accountLimits } = recordingClient();
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
     modelTurn(agent);
     let release: (value: typeof usageResponse) => void = () => {};
     const getUsage = vi.fn(
@@ -2318,20 +2331,16 @@ describe("usage Markdown", () => {
 
     expect(response.stopReason).toBe("end_turn");
     expect(getUsage).toHaveBeenCalledOnce();
-    expect(accountLimitsUpdates(updates)).toHaveLength(0);
+    expect(accountLimits()).toHaveLength(0);
 
     release(usageResponse);
-    await vi.waitFor(() => expect(accountLimitsUpdates(updates)).toHaveLength(1));
-    const update = accountLimitsUpdates(updates)[0]!.update as any;
-    expect(update.used).toBeGreaterThan(0);
-    expect(update._meta["_claude/accountLimits"]).toEqual({
-      subscriptionType: "max",
-      windows: [
-        { type: "five_hour", utilization: 3, resetsAt: "2026-09-04T16:59:00.000Z" },
-        { type: "seven_day", utilization: 0, resetsAt: "2026-09-04T17:59:00.000Z" },
-        { type: "seven_day_model", model: "Fable", utilization: 0, resetsAt: null },
-      ],
-    });
+    await vi.waitFor(() => expect(accountLimits()).toHaveLength(1));
+    expect(accountLimits()[0]!.params).toEqual({ accountLimits: expectedAccountLimits });
+    // The limits ride on the connection: no session update carries them, so a
+    // client's context usage for the session is left as the turn reported it.
+    expect(
+      updates.filter((update) => update.update._meta?.["_claude/accountLimits"] !== undefined),
+    ).toHaveLength(0);
   });
 
   it("publishes no account limits when the read fails or plan limits do not apply", async () => {
@@ -2341,14 +2350,8 @@ describe("usage Markdown", () => {
       }),
       vi.fn(async () => ({ ...usageResponse, rate_limits_available: false, rate_limits: null })),
     ]) {
-      const updates: SessionNotification[] = [];
-      const errors: unknown[] = [];
-      const agent = new ClaudeAcpAgent(
-        {
-          sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
-        } as unknown as AcpClient,
-        { log: () => {}, error: (...args: unknown[]) => errors.push(args) },
-      );
+      const { client, accountLimits } = recordingClient();
+      const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
       modelTurn(agent);
       agent.sessions[
         "test-session"
@@ -2362,8 +2365,88 @@ describe("usage Markdown", () => {
       await new Promise((resolve) => setImmediate(resolve));
 
       expect(response.stopReason).toBe("end_turn");
-      expect(accountLimitsUpdates(updates)).toHaveLength(0);
+      expect(accountLimits()).toHaveLength(0);
     }
+  });
+
+  it("reads the account limits on demand from an open session", async () => {
+    const { client } = recordingClient();
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    modelTurn(agent);
+    const getUsage = vi.fn(async () => usageResponse);
+    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+      getUsage as never;
+    const openQuery = vi.spyOn(agent, "openAccountLimitsQuery");
+
+    const [first, second] = await Promise.all([
+      agent.readAccountLimits(),
+      agent.readAccountLimits(),
+    ]);
+
+    expect(first).toEqual({ accountLimits: expectedAccountLimits });
+    expect(second).toEqual(first);
+    // Callers that overlap share one read.
+    expect(getUsage).toHaveBeenCalledOnce();
+    expect(openQuery).not.toHaveBeenCalled();
+  });
+
+  it("reads the account limits on demand without a session and closes its query", async () => {
+    const { client } = recordingClient();
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const close = vi.fn();
+    vi.spyOn(agent, "openAccountLimitsQuery").mockResolvedValue({
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => usageResponse,
+      close,
+    } as never);
+
+    expect(await agent.readAccountLimits()).toEqual({
+      accountLimits: expectedAccountLimits,
+    });
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("answers an on-demand read with null when the standalone query cannot start", async () => {
+    const { client } = recordingClient();
+    const errors: unknown[] = [];
+    const agent = new ClaudeAcpAgent(client, {
+      log: () => {},
+      error: (...args: unknown[]) => errors.push(args),
+    });
+    vi.spyOn(agent, "openAccountLimitsQuery").mockRejectedValue(new Error("spawn failed"));
+
+    expect(await agent.readAccountLimits()).toEqual({
+      accountLimits: null,
+    });
+    expect(errors).toHaveLength(1);
+  });
+
+  it("serves the on-demand read and the limits notification over the wire", async () => {
+    const toAgent = new TransformStream<Uint8Array>();
+    const toClient = new TransformStream<Uint8Array>();
+    let agent!: ClaudeAcpAgent;
+    v1AgentApp({ log: () => {}, error: () => {} }, (created) => {
+      agent = created;
+      vi.spyOn(created, "openAccountLimitsQuery").mockResolvedValue({
+        usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => usageResponse,
+        close: () => {},
+      } as never);
+    }).connect(ndJsonStream(toClient.writable, toAgent.readable));
+    const pushed: unknown[] = [];
+    const { agent: peer } = acpClient({ name: "test-client" })
+      .onNotification<unknown>("_claude/accountLimits", { parse: (params) => params }, (ctx) => {
+        pushed.push(ctx.params);
+      })
+      .connect(ndJsonStream(toAgent.writable, toClient.readable));
+
+    expect(await peer.request<unknown, unknown>("_claude/accountLimits/read", {})).toEqual({
+      accountLimits: expectedAccountLimits,
+    });
+
+    await (agent as unknown as { client: AcpClient }).client.extNotification(
+      "_claude/accountLimits",
+      { accountLimits: expectedAccountLimits },
+    );
+    await vi.waitFor(() => expect(pushed).toEqual([{ accountLimits: expectedAccountLimits }]));
   });
 
   it("does not append usage Markdown to a model-generated /usage result", async () => {
