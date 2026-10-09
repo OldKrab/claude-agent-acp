@@ -6227,18 +6227,22 @@ export class ClaudeAcpAgent {
                   // stop reason — the accumulated `stopReason` belongs to
                   // the user-turn lifecycle and may still hold the PREVIOUS
                   // turn's value here.
-                  try {
-                    await this.client.extNotification?.("_session/turn_ended", {
-                      sessionId: params.sessionId,
-                      stopReason: message.stop_reason ?? "end_turn",
-                      ...(message.origin && {
-                        _meta: { "_claude/origin": message.origin },
-                      }),
-                    });
-                  } catch (error) {
-                    this.logger.error(
-                      `Session ${params.sessionId}: _session/turn_ended notification failed: ${error}`,
-                    );
+                  // A placeholder result (`num_turns: 0`, see above) comes before
+                  // the followup that answers it, so the cycle is not over yet.
+                  if (message.num_turns > 0) {
+                    try {
+                      await this.client.extNotification?.("_session/turn_ended", {
+                        sessionId: params.sessionId,
+                        stopReason: message.stop_reason ?? "end_turn",
+                        ...(message.origin && {
+                          _meta: { "_claude/origin": message.origin },
+                        }),
+                      });
+                    } catch (error) {
+                      this.logger.error(
+                        `Session ${params.sessionId}: _session/turn_ended notification failed: ${error}`,
+                      );
+                    }
                   }
                 }
                 break;

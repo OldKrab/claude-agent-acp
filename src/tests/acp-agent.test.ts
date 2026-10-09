@@ -7665,6 +7665,67 @@ describe("stop reason propagation", () => {
     expect(ended.params._meta["_claude/origin"]).toEqual({ kind: "task-notification" });
   });
 
+  it("does not announce a placeholder autonomous result", async () => {
+    // Two queued background-task completions share one followup: the first
+    // result is a `num_turns: 0` placeholder that comes before the followup
+    // runs. Only the followup's own result ends the cycle.
+    const extNotifications: { method: string; params: any }[] = [];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      extNotification: async (method: string, params: any) => {
+        extNotifications.push({ method, params });
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    const input = new Pushable<any>();
+    const promptResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+    const autonomousResult = {
+      ...createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+      origin: { kind: "task-notification" },
+    };
+    const followupSeen = new Pushable<void>();
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield promptResult;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      yield { ...autonomousResult, num_turns: 0 };
+      // The consumer asks for this message only after it handled the placeholder.
+      expect(extNotifications).toEqual([]);
+      yield autonomousResult;
+      followupSeen.push();
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+      cwd: "/tmp/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/tmp/test", mcpServers: [] }),
+    });
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    await followupSeen[Symbol.asyncIterator]().next();
+    expect(extNotifications.filter((n) => n.method === "_session/turn_ended")).toHaveLength(1);
+  });
+
   it("does not announce a background result consumed during a live prompt", async () => {
     // Same shape as the consume-background-results test above, with the
     // extension captured: a background result that lands while the user's
