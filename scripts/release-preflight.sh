@@ -129,5 +129,5 @@ Ready to release $title_version.
 
   gh pr merge $pr_number --squash
 
-Merging tags $expected_tag and publishes to npm.
+Merging tags $expected_tag, publishes to npm and requests the OpenAIDE pin update.
 EOF
