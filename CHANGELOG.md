@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.2.0...openaide-claude-agent-acp-v1.3.0) (2026-10-09)
+
+
+### Features
+
+* push account limits on the connection and read them on demand ([#8](https://github.com/OldKrab/claude-agent-acp/issues/8)) ([1ef38fa](https://github.com/OldKrab/claude-agent-acp/commit/1ef38fad8ce19858298ee0f13cebca21b77ffbe5))
+
 ## [1.2.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.1.0...openaide-claude-agent-acp-v1.2.0) (2026-10-09)
 
 
