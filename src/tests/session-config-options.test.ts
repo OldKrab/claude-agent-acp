@@ -1241,6 +1241,20 @@ describe("session config options", () => {
       expect(session.query.getContextUsage).not.toHaveBeenCalled();
       expect(session.contextWindowSize).toBe(1_000_000);
     });
+
+    it("forgets the previous model's compaction window on a switch", async () => {
+      const session = getSession();
+      session.autoCompactWindow = 300_000;
+      session.query.getContextUsage = vi.fn(() => new Promise<never>(() => {}));
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(session.autoCompactWindow).toBeUndefined();
+    });
   });
 
   describe("auto mode availability per model", () => {

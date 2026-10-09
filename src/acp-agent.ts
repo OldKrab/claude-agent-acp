@@ -1057,6 +1057,14 @@ export type Session = {
    *  happens to equal DEFAULT_CONTEXT_WINDOW must not be mistaken for "unseeded"
    *  and clobbered by a "1m" text match. */
   contextWindowAuthoritative: boolean;
+  /** The window the CLI compacts against, from
+   *  `getContextUsage().rawMaxTokens`. The `autoCompactWindow` setting lowers
+   *  it below the model's window (e.g. 300000 on a 1M model), and
+   *  `result.modelUsage` never reflects that, so it is kept apart from
+   *  `contextWindowSize` and applied as a cap when reporting `size` (see
+   *  {@link reportedContextWindow}). Unset until the background read answers,
+   *  and again after a model switch: the setting can differ per model. */
+  autoCompactWindow?: number;
   /** Stable identifier of the LLM backend this session's query was created
    *  against, derived from the routing-relevant vars of the exact `env` handed
    *  to the SDK at query creation (see {@link providerCacheKeyFor}). The context
@@ -5289,9 +5297,8 @@ export class ClaudeAcpAgent {
                 // SDK frames without post_tokens fall back to used:0 and are
                 // corrected by the next result message.
                 //
-                // `size` keeps coming from session.contextWindowSize —
-                // compaction frees occupancy, it doesn't change the model's
-                // window.
+                // `size` keeps coming from the session's window — compaction
+                // frees occupancy, it doesn't change the model's window.
                 //
                 const compactMetadata = message.compact_metadata;
                 await compaction.finish(
@@ -5309,7 +5316,7 @@ export class ClaudeAcpAgent {
                   update: attachUsageModel({
                     sessionUpdate: "usage_update",
                     used: lastAssistantTotalUsage,
-                    size: session.contextWindowSize,
+                    size: reportedContextWindow(session),
                   }),
                 });
                 break;
@@ -6209,7 +6216,7 @@ export class ClaudeAcpAgent {
                   update: attachUsageModel({
                     sessionUpdate: "usage_update",
                     used: lastAssistantTotalUsage,
-                    size: session.contextWindowSize,
+                    size: reportedContextWindow(session),
                     cost: {
                       amount: message.total_cost_usd,
                       currency: "USD",
@@ -6785,7 +6792,7 @@ export class ClaudeAcpAgent {
                   update: attachUsageModel({
                     sessionUpdate: "usage_update",
                     used: nextUsage,
-                    size: session.contextWindowSize,
+                    size: reportedContextWindow(session),
                   }),
                 });
               }
@@ -7257,7 +7264,7 @@ export class ClaudeAcpAgent {
                 update: attachUsageModel({
                   sessionUpdate: "usage_update",
                   used: lastAssistantTotalUsage,
-                  size: session.contextWindowSize,
+                  size: reportedContextWindow(session),
                   _meta: { "_claude/rateLimit": message.rate_limit_info },
                 }),
               });
@@ -8728,13 +8735,13 @@ export class ClaudeAcpAgent {
         availableModes: this.sessionModes.availableModeIds(session.modes),
         prePlanMode: session.prePlanMode,
         contextUsedPercent:
-          session.contextUsedTokens === undefined || session.contextWindowSize <= 0
+          session.contextUsedTokens === undefined || reportedContextWindow(session) <= 0
             ? undefined
             : Math.max(
                 0,
                 Math.min(
                   100,
-                  Math.round((session.contextUsedTokens / session.contextWindowSize) * 100),
+                  Math.round((session.contextUsedTokens / reportedContextWindow(session)) * 100),
                 ),
               ),
       });
@@ -8990,9 +8997,13 @@ export class ClaudeAcpAgent {
    *
    * Does not write `contextWindowCache` (that stays keyed to the
    * `result.modelUsage` spellings) — a later result still overwrites this.
+   *
+   * Also runs when the seed was already authoritative, because
+   * `rawMaxTokens` is the only source of the compaction window
+   * (`session.autoCompactWindow`): the cache and `result.modelUsage` carry the
+   * model's window only.
    */
   private refreshContextWindowInBackground(sessionId: string, session: Session): void {
-    if (session.contextWindowAuthoritative) return;
     const { query } = session;
     const modelId = session.models.currentModelId;
     const stillCurrent = () =>
@@ -9004,8 +9015,13 @@ export class ClaudeAcpAgent {
       .then(() => query.getContextUsage({ detail: "summary" }))
       .then(
         (usage) => {
-          if (!stillCurrent() || session.contextWindowAuthoritative) return;
+          if (!stillCurrent()) return;
           if (!(usage.rawMaxTokens > 0)) return;
+          // TODO: re-read after a turn that ran /autocompact; until then a
+          // mid-session change to the setting shows up only on the next model
+          // switch or session load.
+          session.autoCompactWindow = usage.rawMaxTokens;
+          if (session.contextWindowAuthoritative) return;
           session.contextWindowSize = usage.rawMaxTokens;
           session.contextWindowAuthoritative = true;
         },
@@ -9042,6 +9058,7 @@ export class ClaudeAcpAgent {
         const seeded = immediateContextWindow(session.providerCacheKey, value, newModelInfo);
         session.contextWindowSize = seeded.size;
         session.contextWindowAuthoritative = seeded.authoritative;
+        session.autoCompactWindow = undefined;
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -11874,6 +11891,18 @@ function commonPrefixLength(a: string, b: string) {
 function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
   if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
   return null;
+}
+
+/** The `size` to report in `usage_update`: the model's window, capped by the
+ *  window the CLI compacts against. With `autoCompactWindow: 300000` on a 1M
+ *  model this is 300000, the point the session can actually fill to, where
+ *  `contextWindowSize` alone would report 1000000 from the first result on. */
+function reportedContextWindow(
+  session: Pick<Session, "contextWindowSize" | "autoCompactWindow">,
+): number {
+  return session.autoCompactWindow === undefined
+    ? session.contextWindowSize
+    : Math.min(session.contextWindowSize, session.autoCompactWindow);
 }
 
 /** Cross-session cache of authoritative context windows, keyed by
