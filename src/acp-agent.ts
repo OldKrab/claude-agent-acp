@@ -154,6 +154,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import packageJson from "../package.json" with { type: "json" };
@@ -275,7 +276,14 @@ import {
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
-import { ACCOUNT_LIMITS_META_KEY, readAccountLimits } from "./account-limits.js";
+import {
+  ACCOUNT_LIMITS_READ_METHOD,
+  ACCOUNT_LIMITS_UPDATE_METHOD,
+  type AccountLimits,
+  type AccountLimitsReadResponse,
+  readAccountLimits,
+  readAccountLimitsWithoutSession,
+} from "./account-limits.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
@@ -3255,6 +3263,64 @@ export class ClaudeAcpAgent {
     return {};
   }
 
+  /** In-flight on-demand read, shared by every caller that arrives meanwhile. */
+  private accountLimitsRead?: Promise<AccountLimits | null>;
+
+  /**
+   * `_claude/accountLimits/read` — the plan windows right now, for a client
+   * that has no turn to wait for. `accountLimits` is null when plan limits do
+   * not apply or the read failed.
+   *
+   * An open session's query answers when there is one; otherwise a throwaway
+   * query does. Client-managed routing means the traffic is not metered by the
+   * agent-owned subscription, so there is nothing truthful to report.
+   */
+  async readAccountLimits(): Promise<AccountLimitsReadResponse> {
+    return { accountLimits: await this.readAccountLimitsNow() };
+  }
+
+  private readAccountLimitsNow(): Promise<AccountLimits | null> {
+    if (this.resolveProviderConfig()) return Promise.resolve(null);
+    if (this.accountLimitsRead) return this.accountLimitsRead;
+    const started = Date.now();
+    const session = Object.values(this.sessions).find(
+      (candidate) => !candidate.abortController.signal.aborted,
+    );
+    const read = (
+      session
+        ? readAccountLimits(session.query, session.abortController.signal, this.logger)
+        : readAccountLimitsWithoutSession(
+            (prompt) => this.openAccountLimitsQuery(prompt),
+            this.logger,
+          )
+    ).then((limits) => {
+      this.logger.log(
+        `[accountLimits/read] source=${session ? "session" : "standalone"} outcome=${limits ? "read" : "none"} ms=${Date.now() - started}`,
+      );
+      return limits;
+    });
+    this.accountLimitsRead = read;
+    void read.finally(() => {
+      if (this.accountLimitsRead === read) this.accountLimitsRead = undefined;
+    });
+    return read;
+  }
+
+  /** Opens the query behind a session-less limits read. It loads no settings,
+   *  tools or session history: only the control channel is used. A seam for
+   *  tests, which must not spawn the CLI. */
+  async openAccountLimitsQuery(prompt: AsyncIterable<never>): Promise<Query> {
+    return query({
+      prompt,
+      options: {
+        cwd: os.tmpdir(),
+        settingSources: [],
+        persistSession: false,
+        pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
+      },
+    });
+  }
+
   resolveProviderConfig(): ProviderConfig | null {
     return this.providerConfig ?? gatewayRequestToProviderConfig(this.gatewayAuthRequest);
   }
@@ -4195,8 +4261,8 @@ export class ClaudeAcpAgent {
     // Plan rate limits belong to the account, not to this session, and the
     // SDK only pushes them when a request is close to a limit. Reading them
     // after each turn keeps the client's view current. The read never delays
-    // or fails the turn: it runs detached, and its update may arrive after
-    // the prompt response.
+    // or fails the turn: it runs detached, and its notification may arrive
+    // after the prompt response.
     let accountLimitsRead: Promise<void> | undefined;
     const publishAccountLimits = () => {
       const alreadyRead = session.usageReadDuringTurn === true;
@@ -4205,17 +4271,9 @@ export class ClaudeAcpAgent {
       const signal = session.abortController.signal;
       accountLimitsRead = readAccountLimits(session.query, signal, this.logger)
         .then(async (limits) => {
-          // A usage_update must carry context usage; without a reading yet
-          // there is no truthful one to send the limits on.
-          if (!limits || lastAssistantTotalUsage === null || signal.aborted) return;
-          await sendUpdate({
-            sessionId: params.sessionId,
-            update: attachUsageModel({
-              sessionUpdate: "usage_update",
-              used: lastAssistantTotalUsage,
-              size: session.contextWindowSize,
-              _meta: { [ACCOUNT_LIMITS_META_KEY]: limits },
-            }),
+          if (!limits || signal.aborted) return;
+          await this.client.extNotification(ACCOUNT_LIMITS_UPDATE_METHOD, {
+            accountLimits: limits,
           });
         })
         .catch((error) => this.logger.error(`Account limits update failed: ${error}`))
@@ -11772,6 +11830,12 @@ export function v1AgentApp(
       GOAL_CONTROL_METHOD,
       { parse: parseGoalRequest },
       (ctx) => agent.goal(ctx.params),
+    )
+    .onRequest<Record<string, never>, AccountLimitsReadResponse>(
+      ACCOUNT_LIMITS_READ_METHOD,
+      // The request takes no parameters; whatever a client sends is ignored.
+      { parse: () => ({}) },
+      () => agent.readAccountLimits(),
     );
 }
 
