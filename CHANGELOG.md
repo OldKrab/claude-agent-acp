@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.5.0...openaide-claude-agent-acp-v1.6.0) (2026-10-12)
+
+
+### Features
+
+* report Monitors and subagent background work to clients that track session work ([#16](https://github.com/OldKrab/claude-agent-acp/issues/16)) ([134ff55](https://github.com/OldKrab/claude-agent-acp/commit/134ff554c2405c6a1cd1e090d06c4e7c72255f3d))
+
 ## [1.5.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.4.0...openaide-claude-agent-acp-v1.5.0) (2026-10-09)
 
 
