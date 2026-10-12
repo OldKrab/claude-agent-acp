@@ -6906,6 +6906,96 @@ describe("subagent permission attribution (issue #851)", () => {
     }
   });
 
+  it("reports the Monitor that a subagent left running in the root session of a client that tracks its work", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        subagents: {},
+        _meta: { "async-tasks": true },
+      } as ClientCapabilities & { subagents: Record<string, never> },
+    });
+    const system = (fields: Record<string, unknown>) => ({
+      type: "system",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...fields,
+    });
+    const assistant = (parentToolUseId: string | null, content: unknown[]) => ({
+      type: "assistant",
+      parent_tool_use_id: parentToolUseId,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: { role: "assistant", content, usage: SUBAGENT_TEST_USAGE },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        assistant(null, [
+          {
+            type: "tool_use",
+            id: "toolu_agent",
+            name: "Agent",
+            input: { description: "Investigate", prompt: "Find the bug" },
+          },
+        ]),
+        { ...taskStarted("agent-1", "toolu_agent"), subagent_type: "Explore" },
+        assistant("toolu_agent", [
+          {
+            type: "tool_use",
+            id: "child-monitor",
+            name: "Monitor",
+            input: { command: "tail -f app.log", description: "Watch app.log" },
+          },
+        ]),
+        // The SDK reports a Monitor task as a background shell.
+        system({
+          subtype: "task_started",
+          task_id: "mon-1",
+          task_type: "local_bash",
+          description: "Watch app.log",
+          is_backgrounded: true,
+          tool_use_id: "child-monitor",
+        }),
+        // The subagent ends its run. The Monitor still runs and wakes it later.
+        system({
+          subtype: "task_notification",
+          task_id: "agent-1",
+          tool_use_id: "toolu_agent",
+          status: "completed",
+          output_file: "",
+          summary: "interim",
+        }),
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const tasks = updates.flatMap(({ sessionId, update }) =>
+      update.sessionUpdate.startsWith("async_task_") ? [{ sessionId, ...update }] : [],
+    );
+    // The tool call is in the subagent session, so the root session does not name it.
+    expect(tasks).toEqual([
+      {
+        sessionId: "test-session",
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: "mon-1",
+        name: "Watch app.log",
+        taskType: "monitor",
+        description: "Watch app.log",
+        showInTranscript: true,
+        canStop: true,
+      },
+    ]);
+  });
+
   it("holds async_task_spawned until the Bash result brings the tool id", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(

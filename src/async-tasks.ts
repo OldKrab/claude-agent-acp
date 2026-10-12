@@ -115,6 +115,29 @@ export function clientSupportsAsyncTasks(capabilities?: ClientCapabilities | nul
   );
 }
 
+/**
+ * Whether the client reads async tasks to know that work remains after the
+ * prompt response. Such a client asks with the `async-tasks` key. It gets
+ * Monitor tasks, and it gets the tasks of a subagent in the root session: a
+ * Monitor or a command that a subagent left running wakes the model of the
+ * root session, so the root session still has work.
+ */
+export function clientTracksSessionWork(capabilities?: ClientCapabilities | null): boolean {
+  return capabilities?._meta?.[ASYNC_TASKS_META_KEY] === true;
+}
+
+/**
+ * The route of a task that a subagent tool call started, for a client that
+ * tracks the work of the session. The task stays in the root session. The
+ * tool call is in the subagent session, so the root session does not name it.
+ */
+export function rootSessionRoute(notification: AcpSessionNotification): AcpSessionNotification {
+  if (!("toolCallId" in notification.update)) return notification;
+  const update: Record<string, unknown> = { ...notification.update };
+  delete update.toolCallId;
+  return { ...notification, update: update as AcpSessionNotification["update"] };
+}
+
 /** Publishes Claude's non-agent background work as a separate AIR task lifecycle. */
 export class AsyncTaskRuntime {
   /**
@@ -140,9 +163,11 @@ export class AsyncTaskRuntime {
      *  the tasks that a tool call in another session started, for example in
      *  a native subagent session. `toolNameOf`: the name of the tool of a tool
      *  call, or `undefined` when the tool call is unknown. A task that a
-     *  `Monitor` tool call started is ignored. */
+     *  `Monitor` tool call started is ignored, unless `monitors` is set: then
+     *  the client gets it with the task type `monitor`. */
     private readonly options: {
       notices?: boolean;
+      monitors?: boolean;
       routeOf?: (toolCallId: string) => Route | undefined;
       toolNameOf?: (toolCallId: string) => string | undefined;
     } = {},
@@ -153,7 +178,7 @@ export class AsyncTaskRuntime {
     const taskId = taskIdOf(message);
     if (!taskId) return;
     const task = this.task(taskId);
-    if (isSubagentTask(message) || isMonitorTask(message)) {
+    if (isSubagentTask(message) || this.isHiddenMonitor(message)) {
       this.ignore(task);
       return;
     }
@@ -184,7 +209,7 @@ export class AsyncTaskRuntime {
     const taskId = taskIdOf(message);
     if (!taskId) return;
     const task = this.task(taskId);
-    if (isSubagentTask(message) || isMonitorTask(message)) {
+    if (isSubagentTask(message) || this.isHiddenMonitor(message)) {
       this.ignore(task);
       return;
     }
@@ -352,7 +377,10 @@ export class AsyncTaskRuntime {
       const task = this.task(taskId);
       if (task.ignored || isTerminal(task.state)) continue;
       const levelTaskType = field(item, "taskType", "task_type");
-      if (levelTaskType === "local_agent" || levelTaskType === "local_monitor") {
+      if (
+        levelTaskType === "local_agent" ||
+        (levelTaskType === "local_monitor" && !this.options.monitors)
+      ) {
         this.ignore(task);
         continue;
       }
@@ -503,6 +531,10 @@ export class AsyncTaskRuntime {
    * Marks a task that the client never sees. Only a task that is not announced
    * can become ignored, so the client never holds a task without its end.
    */
+  private isHiddenMonitor(message: AsyncTaskStarted): boolean {
+    return !this.options.monitors && isMonitorTask(message);
+  }
+
   private ignore(task: AsyncTask): void {
     if (task.announced) return;
     task.ignored = true;
@@ -622,7 +654,9 @@ export class AsyncTaskRuntime {
    * A task that a `Monitor` tool call started is ignored: Monitor streams its
    * output to the model only, so the task has nothing for the client. The
    * tool_use streams before the tool runs, so the tool name is known when the
-   * spawn has the tool call id.
+   * spawn has the tool call id. With the `monitors` option the client gets the
+   * task instead. The SDK reports it as a shell, so the tool name gives it the
+   * `monitor` type.
    */
   private async announce(
     task: AsyncTask,
@@ -630,9 +664,12 @@ export class AsyncTaskRuntime {
   ): Promise<void> {
     if (task.announced || task.ignored) return;
     const toolName = task.toolCallId ? this.options.toolNameOf?.(task.toolCallId) : undefined;
-    if (toolName !== undefined && HIDDEN_TASK_TOOLS.has(toolName)) {
-      this.ignore(task);
-      return;
+    if (toolName !== undefined && MONITOR_TOOLS.has(toolName)) {
+      if (!this.options.monitors) {
+        this.ignore(task);
+        return;
+      }
+      task.taskType = "monitor";
     }
     if (!task.toolCallId && !options.withoutToolCall && !isTerminal(task.state)) {
       task.held = true;
@@ -994,8 +1031,8 @@ function isBackgroundTask(isBackgrounded: unknown, taskType: unknown): boolean {
   return taskType !== "local_bash" && taskType !== "local_agent";
 }
 
-/** The tools whose async tasks the client never sees. */
-const HIDDEN_TASK_TOOLS = new Set(["Monitor"]);
+/** The tools whose async tasks are Monitor tasks. */
+const MONITOR_TOOLS = new Set(["Monitor"]);
 
 function isMonitorTask(message: AsyncTaskStarted): boolean {
   return field(message, "taskType", "task_type") === "local_monitor";

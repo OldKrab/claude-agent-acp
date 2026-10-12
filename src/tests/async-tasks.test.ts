@@ -4,6 +4,8 @@ import {
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
   clientSupportsAsyncTasks,
+  clientTracksSessionWork,
+  rootSessionRoute,
 } from "../async-tasks.js";
 
 describe("AsyncTaskRuntime", () => {
@@ -62,6 +64,57 @@ describe("AsyncTaskRuntime", () => {
       outputFilePath: "/private/tmp/claude/tasks/bpux8xmfg.output",
       toolCallId: "bash-tool",
     });
+  });
+
+  it("keeps a task of a subagent tool call in the root session without the tool call", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(
+      true,
+      "root",
+      async (notification) => {
+        published.push(notification);
+      },
+      { routeOf: (toolCallId) => (toolCallId === "child-tool" ? rootSessionRoute : undefined) },
+    );
+
+    await runtime.taskStarted({
+      taskId: "child-task",
+      taskType: "local_bash",
+      description: "npm run dev",
+      isBackgrounded: true,
+      toolCallId: "child-tool",
+    });
+    await runtime.taskNotification({ taskId: "child-task", status: "completed" });
+
+    expect(published).toEqual([
+      {
+        sessionId: "root",
+        update: {
+          sessionUpdate: "async_task_spawned",
+          asyncTaskId: "child-task",
+          name: "npm run dev",
+          taskType: "shell",
+          description: "npm run dev",
+          showInTranscript: true,
+          canStop: true,
+        },
+      },
+      {
+        sessionId: "root",
+        update: {
+          sessionUpdate: "async_task_state_update",
+          asyncTaskId: "child-task",
+          state: "completed",
+        },
+      },
+    ]);
+  });
+
+  it("tracks the work of the session only for the async-tasks key", () => {
+    expect(clientTracksSessionWork({ _meta: { "async-tasks": true } })).toBe(true);
+    expect(clientTracksSessionWork({ _meta: { "async-tasks": false } })).toBe(false);
+    expect(clientTracksSessionWork({})).toBe(false);
+    expect(clientTracksSessionWork(null)).toBe(false);
   });
 
   it("sends every update of a task to the session that owned its tool call at the spawn", async () => {
@@ -1280,6 +1333,53 @@ describe("AsyncTaskRuntime", () => {
 
       expect(published).toEqual([]);
       expect(runtime.canStop("started")).toBe(false);
+    });
+
+    it("announces a Monitor task as a monitor to a client that tracks the work of the session", async () => {
+      const published: AcpSessionNotification[] = [];
+      const runtime = new AsyncTaskRuntime(
+        true,
+        "session",
+        async (notification) => {
+          published.push(notification);
+        },
+        { monitors: true, toolNameOf: (toolCallId) => toolNames[toolCallId] },
+      );
+
+      // The SDK reports a Monitor task as a background shell.
+      await runtime.taskStarted({
+        task_id: "monitor",
+        task_type: "local_bash",
+        description: "Watch the logs",
+        is_backgrounded: true,
+        tool_use_id: "monitor-tool",
+      });
+      await runtime.backgroundTasksChanged([
+        { task_id: "monitor", task_type: "local_bash" },
+        { task_id: "level", task_type: "local_monitor" },
+      ]);
+      await runtime.releaseHeld();
+      expect(runtime.canStop("monitor")).toBe(true);
+      await runtime.taskNotification({ task_id: "monitor", status: "completed" });
+
+      expect(published.map((notification) => notification.update)).toEqual([
+        {
+          sessionUpdate: "async_task_spawned",
+          asyncTaskId: "monitor",
+          name: "Watch the logs",
+          taskType: "monitor",
+          description: "Watch the logs",
+          showInTranscript: true,
+          canStop: true,
+          toolCallId: "monitor-tool",
+        },
+        expect.objectContaining({
+          sessionUpdate: "async_task_spawned",
+          asyncTaskId: "level",
+          taskType: "monitor",
+        }),
+        { sessionUpdate: "async_task_state_update", asyncTaskId: "monitor", state: "completed" },
+      ]);
     });
 
     it("still announces a task of another tool", async () => {
