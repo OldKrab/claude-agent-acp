@@ -134,6 +134,8 @@ import {
   backgroundBashTaskFromToolResult,
   backgroundedBashToolCallIds,
   clientSupportsAsyncTasks,
+  clientTracksSessionWork,
+  rootSessionRoute,
 } from "./async-tasks.js";
 import {
   AUTH_STATUS_PROBE_TIMEOUT_MS,
@@ -4060,19 +4062,24 @@ export class ClaudeAcpAgent {
      *  `tool_use_id` so hosts can collapse them; a notice has no lifecycle to
      *  update, so only the first becomes one. */
     const noticedToolUses = new Set<string>();
+    const tracksSessionWork = clientTracksSessionWork(this.clientCapabilities);
     const asyncTasks = (session.asyncTaskRuntime ??= new AsyncTaskRuntime(
       clientSupportsAsyncTasks(this.clientCapabilities),
       params.sessionId,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       {
         notices: supportsNotices,
+        monitors: tracksSessionWork,
         // A task that a subagent tool call started belongs to the child
-        // session of that tool call, like the tool call itself.
-        routeOf: (toolCallId) =>
-          session.nativeSubagentRuntime?.routeOfToolCall(
+        // session of that tool call, like the tool call itself. A client
+        // that tracks the work of the session gets it in the root session.
+        routeOf: (toolCallId) => {
+          const childRoute = session.nativeSubagentRuntime?.routeOfToolCall(
             toolCallId,
             session.eagerToolCallSessions?.get(toolCallId),
-          ),
+          );
+          return childRoute && tracksSessionWork ? rootSessionRoute : childRoute;
+        },
         toolNameOf: (toolCallId) =>
           session.toolUseCache[toolCallId]?.name ?? session.resolvedToolNames?.get(toolCallId),
       },

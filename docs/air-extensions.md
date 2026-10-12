@@ -875,6 +875,9 @@ The `Monitor` tool call stays in the transcript.
 The adapter also ignores a `local_monitor` task.
 A task that a subagent tool call started goes to the subagent session.
 Its spawn, progress and state updates go there also after the subagent finished.
+A client that opts in with the `async-tasks` key reads the tasks to know that work remains after the prompt response.
+For that client a Monitor task is an async task with the `monitor` task type, and a task that a subagent tool call started stays in the root session, without `toolCallId`.
+A Monitor or a command that a subagent left running wakes the model of the root session, so the root session still has work.
 
 ### Updates
 
