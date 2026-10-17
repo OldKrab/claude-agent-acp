@@ -50,5 +50,5 @@ prints rather than merging.
 
 The package is `@openaide/claude-agent-acp`, versioned independently of upstream
 and tagged `openaide-claude-agent-acp-vX.Y.Z`. `upstream-sync.yml` opens one PR
-per upstream release. Full runbook, including how to recover a stalled release:
+per upstream release and closes unmerged PRs for older releases. Full runbook, including how to recover a stalled release:
 [`docs/RELEASES.md`](docs/RELEASES.md).

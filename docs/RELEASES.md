@@ -168,6 +168,12 @@ Before merging an upstream update, review the resulting product changes and let
 the normal PR CI pass. A closed update PR is treated as an intentional dismissal;
 the next upstream release gets its own PR.
 
+Like Dependabot, a newer upstream release replaces older unmerged update PRs:
+while the newest release's PR is open, the sync closes every older update PR
+with a `Superseded by #N` comment and deletes its branch. A branch carrying
+commits from anyone other than `github-actions[bot]`, such as maintainer
+conflict fixes, is kept so that work can be carried into the newer update.
+
 ## Credentials and repository settings
 
 | Secret                                             | Used for                                                          |

@@ -177,7 +177,7 @@ jobs:
 
           The daily sync prepares the immutable upstream release against current main, preserving the \`@openaide/claude-agent-acp\` package identity and fork-owned release files. Automation refreshes its own branch as main advances and stops rewriting it after maintainer commits.
 
-          A draft means source or dependency conflicts need manual resolution. Its branch may point at the raw upstream release: resolve the conflicts and preserve the fork package identity and release files before marking ready. A closed PR suppresses recreation for that tag.
+          A draft means source or dependency conflicts need manual resolution. Its branch may point at the raw upstream release: resolve the conflicts and preserve the fork package identity and release files before marking ready. A closed PR suppresses recreation for that tag. If a newer upstream release arrives before this PR merges, its update PR closes this one as superseded; a branch with maintainer commits is kept.
 
           The normal pull-request CI suite validates prepared merges. Review the release impact and use a release-triggering conventional title before merging when a package release is intended.
           EOF
@@ -190,3 +190,75 @@ jobs:
             --head "$BRANCH" \
             --title "chore: sync upstream ${TAG}" \
             --body-file "$body"
+
+      # Like Dependabot, the update PR for the newest release replaces unmerged
+      # update PRs for older releases, because the newer release already contains
+      # their upstream changes. Runs whenever that PR is open, so an older PR is
+      # also closed on days the newest branch is kept for maintainer edits.
+      - name: Close update pull requests for older releases
+        if: steps.release.outputs.required == 'true'
+        env:
+          BRANCH: ${{ steps.release.outputs.branch }}
+          GH_TOKEN: ${{ steps.repository-token.outputs.token }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+          TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          current_pr="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "$current_pr" ]]; then
+            echo "No open update PR for ${TAG}; older update PRs are left open"
+            exit 0
+          fi
+
+          # Commits already on main don't count as maintainer work on a branch.
+          git fetch --no-tags --quiet origin "+refs/heads/main:refs/remotes/origin/main"
+
+          prefix="shushakov/sync-upstream-"
+          rows="$(gh pr list --base main --state open --limit 100 \
+            --json number,headRefName,isCrossRepository \
+            --jq ".[] | select(.isCrossRepository | not) | select(.headRefName | startswith(\"${prefix}\")) | \"\(.number) \(.headRefName)\"")"
+
+          # fd 3 keeps gh and git from consuming the PR list on stdin.
+          while read -r number branch <&3; do
+            if [[ -z "$number" || "$branch" == "$BRANCH" ]]; then continue; fi
+            tag="${branch#"$prefix"}"
+            # Only older releases are superseded; sort -V puts v0.9.0 before v0.10.0.
+            if [[ "$(printf '%s\n%s\n' "$tag" "$TAG" | sort -V | head -n 1)" != "$tag" ]]; then
+              echo "Keeping #${number}: ${tag} is newer than ${TAG}"
+              continue
+            fi
+
+            # Delete only branches holding nothing but automation output. Leaving
+            # out commits already on main or in the newer upstream release, what
+            # remains is the sync merge committed by github-actions[bot] (nothing
+            # at all for a conflicted draft that points at the raw release),
+            # unless a maintainer pushed work such as conflict fixes.
+            head="$(git ls-remote --heads origin "refs/heads/${branch}" | cut -f1)"
+            delete_branch=false
+            if [[ -n "$head" ]]; then
+              git fetch --no-tags --quiet origin "refs/heads/${branch}"
+              maintainer_commits="$(git log --format=%ce "$head" ^refs/remotes/origin/main "^${RELEASE_COMMIT}" |
+                grep -cvxF 'github-actions[bot]@users.noreply.github.com' || true)"
+              if [[ "$maintainer_commits" == "0" ]]; then delete_branch=true; fi
+            fi
+
+            comment="Superseded by #${current_pr}, which tracks upstream ${TAG}."
+            if [[ -n "$head" && "$delete_branch" == "false" ]]; then
+              comment+=" The \`${branch}\` branch has maintainer commits, so it is kept."
+            fi
+            gh pr close "$number" --comment "$comment"
+
+            branch_outcome="kept"
+            if [[ "$delete_branch" == "true" ]]; then
+              # The lease skips the delete if someone pushed after the check above.
+              if git push --quiet --force-with-lease="refs/heads/${branch}:${head}" origin ":refs/heads/${branch}"; then
+                branch_outcome="deleted"
+              else
+                branch_outcome="delete_failed"
+                echo "::warning::Closed #${number} but could not delete ${branch}"
+              fi
+            fi
+            echo "Closed #${number} (${tag}) as superseded by #${current_pr} (${TAG}); branch ${branch_outcome}"
+          done 3<<< "$rows"
