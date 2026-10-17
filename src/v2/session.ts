@@ -17,13 +17,19 @@ import {
   type SessionConfigSelectGroup,
   type SessionConfigSelectOptions,
   type SetSessionConfigOptionRequest,
+  type SystemPrompt,
 } from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import { v1ContentBlock } from "./prompt.js";
 
 export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionRequest {
-  const { mcpServers, ...request } = params;
+  const { mcpServers, systemPrompt, ...request } = params;
   // v1 requires the list; v2 treats an omitted list as an empty one.
-  return { ...request, mcpServers: (mcpServers ?? []).map(v1McpServer) };
+  return {
+    ...request,
+    mcpServers: (mcpServers ?? []).map(v1McpServer),
+    ...v1SystemPromptField(systemPrompt),
+  };
 }
 
 /**
@@ -40,7 +46,8 @@ export function v1RestoreSessionRequest(
 ):
   | { method: "resume"; request: ResumeSessionRequest }
   | { method: "load"; request: LoadSessionRequest } {
-  const { replayFrom, mcpServers, ...request } = params;
+  const { replayFrom, mcpServers, systemPrompt, ...rest } = params;
+  const request = { ...rest, ...v1SystemPromptField(systemPrompt) };
   if (replayFrom == null) {
     return {
       method: "resume",
@@ -60,28 +67,27 @@ export function v1RestoreSessionRequest(
 }
 
 /**
- * The v1 requests that a v2 `session/fork` means.
- *
- * The agent's v1 fork copies the transcript into a new session and returns
- * only its id; a v1 client then resumes or loads it. A v2 fork returns the new
- * session with its config options, like `session/new`, so the client can
- * prompt it. The v2 surface therefore forks, then resumes the fork without
- * replay, with the request's `cwd`, `additionalDirectories`, and
- * `mcpServers`. The request's `_meta` goes to the fork alone.
+ * The v1 request of a v2 `session/fork`. In both versions the agent's fork
+ * returns a session that the client can prompt, with its config options.
  */
-export function v1ForkSessionRequests(params: v2.ForkSessionRequest): {
-  fork: ForkSessionRequest;
-  resume: (sessionId: string) => ResumeSessionRequest;
-} {
-  const { mcpServers, _meta, ...request } = params;
-  const session = {
+export function v1ForkSessionRequest(params: v2.ForkSessionRequest): ForkSessionRequest {
+  const { mcpServers, systemPrompt, ...request } = params;
+  return {
     ...request,
     ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}),
+    ...v1SystemPromptField(systemPrompt),
   };
-  return {
-    fork: { ...session, ...(_meta != null ? { _meta } : {}) },
-    resume: (sessionId) => ({ ...session, sessionId }),
-  };
+}
+
+/**
+ * The v1 `systemPrompt`. Its content converts like prompt content: a v2
+ * annotation audience can be any string, and v1 takes only `user` or `assistant`.
+ */
+function v1SystemPromptField(systemPrompt: v2.SystemPrompt | null | undefined): {
+  systemPrompt?: SystemPrompt;
+} {
+  if (systemPrompt == null) return {};
+  return { systemPrompt: { ...systemPrompt, content: systemPrompt.content.map(v1ContentBlock) } };
 }
 
 /** v2 drops `modes`: the session mode is the `mode` config option, which the agent always lists. */

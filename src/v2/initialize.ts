@@ -14,6 +14,7 @@ import {
   type InitializeResponse,
 } from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import { SYSTEM_PROMPT_CAPABILITY } from "../client-system-prompt.js";
 
 /** The v1 `initialize` request that a v2 client means. */
 export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRequest {
@@ -32,6 +33,15 @@ export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRe
       // compaction as a compaction entity rather than as a "Compact
       // conversation" tool call, also on replay.
       session: { configOptions: { boolean: {} }, notices: {}, compaction: {} },
+      // Every v2 client takes `plan_update`, with the draft's markdown and file
+      // plans, and `plan_removed`; v1 asks for the `plan` marker. With it, the
+      // agent shows an approved ExitPlanMode plan as a markdown plan.
+      plan: {},
+      // Subagent updates are part of v2's baseline session model (the subagents
+      // RFD), so every v2 client takes them; v1 asks for the `subagents`
+      // capability. With it, the agent reports each Agent or Task subagent as a
+      // child session.
+      subagents: {},
       // v1 marks terminal auth support with a boolean, v2 with an object.
       auth: {
         terminal: capabilities?.auth?.terminal != null,
@@ -89,10 +99,11 @@ export function v2InitializeResponse(response: InitializeResponse): v2.Initializ
  * - The session baseline: `session/new`, `list`, `resume` (with replay),
  *   `close`, `prompt`, `cancel`, and `update`.
  * - `session/delete`, `session/fork` (which returns a session the client can
- *   prompt, see `v1ForkSessionRequests`), and `additionalDirectories`.
+ *   prompt at once), and `additionalDirectories`.
  * - The prompt content and MCP transports that the agent's v1 `initialize`
  *   lists: images, embedded context, and HTTP servers. Stdio servers are in the
  *   v1 baseline; v2 has no SSE transport.
+ * - `systemPrompt`, in `append` and `override` mode.
  */
 const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   prompt: { image: {}, embeddedContext: {} },
@@ -100,6 +111,7 @@ const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   delete: {},
   fork: {},
   additionalDirectories: {},
+  systemPrompt: SYSTEM_PROMPT_CAPABILITY,
 };
 
 /** v2 names the id of a method `methodId`, requires `type`, and lists `env` as name and value pairs. */

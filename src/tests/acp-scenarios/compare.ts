@@ -19,6 +19,12 @@
  * - An `available_commands_update` also lists the `mcp` command of the
  *   adapter (see {@link ADAPTER_COMMANDS}), when origin/main did not list
  *   `mcp`. The adapter replaces the text of `/mcp` for every client.
+ * - The `initialize` response does not advertise
+ *   `agentCapabilities.sessionCapabilities.subagents`: the subagents RFD has
+ *   only the client capability, and only AIR's draft keeps the agent one.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.sessionCapabilities.systemPrompt`, which origin/main
+ *   did not: the agent now applies the `systemPrompt` of session requests.
  * - A `terminal_exit` has a `null` exit code where origin/main sent a code
  *   that the tool result does not say (see `CommandOutput.exitCode`): 1 for a
  *   failure that names no code or an interrupted command, 0 for a
@@ -30,6 +36,7 @@ import type { Recorded } from "./harness.js";
 export const AIR_ONLY_META_KEYS = new Set([
   "jetbrains",
   "goal",
+  "promptSuggestions",
   "contextCompaction",
   "kind",
   "permission",
@@ -198,17 +205,34 @@ function isMeta(key: string): boolean {
   return key.startsWith("_meta.");
 }
 
+/** `record` without the session capability `key`, when it is an `initialize` response. */
+function withoutSessionCapability(record: Recorded, key: string): Recorded {
+  if (record.kind !== "initialize") return record;
+  const payload = record.payload as Json;
+  const agent = payload.agentCapabilities as Json | undefined;
+  const session = agent?.sessionCapabilities as Json | undefined;
+  if (!session || !(key in session)) return record;
+  return {
+    ...record,
+    payload: {
+      ...payload,
+      agentCapabilities: { ...agent, sessionCapabilities: without(session, key) },
+    },
+  } as Recorded;
+}
+
 /**
  * Returns the differences between the baseline and the current traffic that
  * the compatibility rule does not allow. An empty list means compatible.
  */
-export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): string[] {
+export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): string[] {
   const expected = baseline
-    .map((record) => withoutAirOnlyKeys(record) as Recorded)
+    .map((record) => withoutSessionCapability(withoutAirOnlyKeys(record) as Recorded, "subagents"))
     .filter((record) => {
       const update = updateOf(record);
       return !(update?.sessionUpdate === "session_info_update" && Object.keys(update).length === 1);
     });
+  const current = traffic.map((record) => withoutSessionCapability(record, "systemPrompt"));
   const violations: string[] = [];
   const state = new Map<string, Map<string, string>>();
   const summaryChunks = new Map<string, string>();
