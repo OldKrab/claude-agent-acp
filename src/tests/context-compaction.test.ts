@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
 import {
+  failedCompactionStatus,
   ContextCompactionLifecycle,
   clientSupportsCompactionUpdates,
   compactionSummaryText,
@@ -360,6 +361,36 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
     // A summary never patches a failed entity.
     compaction.recordSummary("<summary>Still never.</summary>");
     expect(sent).toHaveLength(2);
+  });
+
+  it("closes an aborted compaction as cancelled, and as a failed legacy tool call", async () => {
+    expect(failedCompactionStatus("aborted")).toBe("cancelled");
+    expect(failedCompactionStatus("summary rejected")).toBe("failed");
+    expect(failedCompactionStatus(undefined)).toBe("failed");
+
+    const current = lifecycle("compaction_update");
+    await current.compaction.start("cmp-aborted");
+    await current.compaction.finish("cmp-aborted", "cancelled", { error: "aborted" });
+    await current.compaction.reset();
+    // Cancelled carries no error, and the turn boundary sends no second terminal.
+    expect(current.sent.slice(1)).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "cmp-aborted",
+        status: "cancelled",
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
+      },
+    ]);
+
+    const legacy = lifecycle("tool_call");
+    await legacy.compaction.start("cmp-aborted");
+    await legacy.compaction.finish("cmp-aborted", "cancelled", { error: "aborted" });
+    expect(legacy.sent[1]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "cmp-aborted",
+      status: "failed",
+      content: [{ type: "content", content: { type: "text", text: "Compaction failed: aborted" } }],
+    });
   });
 
   it("streams API compaction text as summary chunks only into an announced entity", async () => {

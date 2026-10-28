@@ -257,6 +257,7 @@ import {
   ContextCompactionLifecycle,
   clientSupportsCompactionUpdates,
   contextCompactionMetadataFromBoundary,
+  failedCompactionStatus,
   isCompactSummaryMessage,
 } from "./context-compaction.js";
 import {
@@ -6135,9 +6136,11 @@ export class ClaudeAcpAgent {
                 } else if (message.compact_result === "success") {
                   await compaction.finish(message.uuid, "completed");
                 } else if (message.compact_result === "failed") {
-                  await compaction.finish(message.uuid, "failed", {
-                    ...(message.compact_error ? { error: message.compact_error } : {}),
-                  });
+                  await compaction.finish(
+                    message.uuid,
+                    failedCompactionStatus(message.compact_error),
+                    { ...(message.compact_error ? { error: message.compact_error } : {}) },
+                  );
                 }
                 break;
               }

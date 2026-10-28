@@ -16913,6 +16913,29 @@ describe("assembled assistant text fallback", () => {
     expect(messageChunkTexts(updates)).toEqual(["additional diagnostic"]);
   });
 
+  it("reports a compaction Claude Code aborted as cancelled, not failed", async () => {
+    // A message steered in mid-compaction aborts the cycle; Claude Code then
+    // reports the compaction as failed with error "aborted".
+    const { agent, updates } = await compactionCapableAgent();
+    injectSession(agent, [
+      compactingStatus(),
+      compactResult("failed", "compact-aborted", "aborted"),
+      replayedResult(""),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(compactionUpdates(updates).slice(1)).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "cancelled",
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
+      },
+    ]);
+  });
+
   it("closes a compaction the turn abandoned as cancelled, before the prompt settles", async () => {
     const { agent, updates } = await compactionCapableAgent();
     injectSession(agent, [compactingStatus(), replayedResult(""), idle]);
