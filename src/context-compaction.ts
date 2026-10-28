@@ -5,8 +5,18 @@ import {
 } from "./context-compaction-meta.js";
 import { compactionToolCall } from "./tool-calls/reporters/compaction.js";
 
-type CompactionStatus = "completed" | "failed";
-type TerminalStatus = CompactionStatus | "cancelled";
+type TerminalStatus = "completed" | "failed" | "cancelled";
+
+/**
+ * The terminal status for Claude Code's `compact_result: "failed"`. Claude Code
+ * reports a compaction its abort signal stopped as failed with
+ * `compact_error: "aborted"`: a cancel, or a message steered in with priority
+ * `now`, which aborts the running cycle mid-compaction. That compaction was
+ * interrupted, not broken, so it closes as `cancelled`.
+ */
+export function failedCompactionStatus(error: string | undefined): "failed" | "cancelled" {
+  return error === "aborted" ? "cancelled" : "failed";
+}
 
 /**
  * How compaction reaches the client.
@@ -314,7 +324,7 @@ export class ContextCompactionLifecycle {
 
   async finish(
     compactionId: string,
-    status: CompactionStatus,
+    status: TerminalStatus,
     metadata: Omit<ContextCompactionMetadata, "version"> = {},
     enrichTerminal = false,
   ): Promise<void> {
@@ -329,7 +339,7 @@ export class ContextCompactionLifecycle {
     } else if (!enrichTerminal) {
       return;
     }
-    if (status === "failed" && metadata.error) {
+    if (status !== "completed" && metadata.error) {
       this.duplicateErrorOutput = metadata.error;
     }
     const terminalStatus = state.terminalStatus ?? status;
@@ -362,10 +372,13 @@ export class ContextCompactionLifecycle {
       return;
     }
 
+    // ACP `ToolCallStatus` has no cancelled state, so the legacy tool call
+    // shows a cancelled compaction as failed with its error.
+    const toolStatus = status === "cancelled" ? "failed" : status;
     await this.send(
       compactionToolCall.finished(
         state.compactionId,
-        opened || firstTerminal ? status : undefined,
+        opened || firstTerminal ? toolStatus : undefined,
         metadata,
         opened,
         this.airClient,
