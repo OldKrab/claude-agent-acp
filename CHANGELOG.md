@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.7.1](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.7.0...openaide-claude-agent-acp-v1.7.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* report a compaction Claude Code aborted as cancelled ([#27](https://github.com/OldKrab/claude-agent-acp/issues/27)) ([5e63797](https://github.com/OldKrab/claude-agent-acp/commit/5e637973576e64e664068618fc94e7f5f1b24377))
+
 ## [1.7.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.6.0...openaide-claude-agent-acp-v1.7.0) (2026-10-17)
 
 
