@@ -515,13 +515,13 @@ describe("ClaudeAcpAgent settings", () => {
         _meta: { disableBuiltInTools: true },
       });
       await agent.setSessionMode({ sessionId, modeId: "default" });
-      const { RequestError } = await import("@agentclientprotocol/sdk");
+      const { RequestError } = await import("@agentclientprotocol/sdk/unstable");
       const createSession = (agent as any).createSession.bind(agent);
       const creations: object[] = [];
       (agent as any).createSession = async (params: object, options: { resume?: string }) => {
         creations.push(options);
         // The CLI never wrote the conversation, so the resume fails.
-        if (options.resume) throw RequestError.resourceNotFound(sessionId);
+        if (options.resume) throw RequestError.sessionNotFound(sessionId);
         return createSession(params, options);
       };
 
