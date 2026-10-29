@@ -1148,6 +1148,20 @@ export type Session = {
    *  the command name. A `commands_changed` clears it, because the skill
    *  files can have changed then. */
   skillPaths?: Map<string, string | undefined>;
+  /** The skill files Claude Code reports in `getContextUsage().skills.skillFrontmatter`,
+   *  keyed by the skill name as the slash command is named (`plug:pskill`).
+   *  `path` is the SKILL.md file, absent for a skill bundled with the CLI and
+   *  on remote connections. Filled by
+   *  {@link ClaudeAcpAgent.refreshSkillFiles}; undefined until the first read. */
+  skillFiles?: Map<string, { path?: string }>;
+  /** True once the first `system`/init has started the first skill file read,
+   *  so the per-turn init re-emit does not start another. */
+  skillFilesRequested?: boolean;
+  /** A skill file read is running; a trigger meanwhile sets `skillFilesRerun`. */
+  skillFilesRefreshing?: boolean;
+  /** A trigger came in during a running read, which may have read the state
+   *  from before it, so one more read follows. */
+  skillFilesRerun?: boolean;
   /** Serialized `system`/init `plugin_errors` last logged, so the per-turn
    *  init re-emit logs a plugin load failure once, not every turn. */
   loggedPluginErrors?: string;
@@ -6195,6 +6209,12 @@ export class ClaudeAcpAgent {
                   message.fast_mode_state,
                   message.fast_mode_disabled_reason,
                 );
+                // The skill files are read once per session here; commands_changed
+                // reads them again. Not awaited, the read takes about a second.
+                if (!session.skillFilesRequested) {
+                  session.skillFilesRequested = true;
+                  void this.refreshSkillFiles(params.sessionId);
+                }
                 // Terminal-bound slash commands (absent when none, and on
                 // older CLIs). The session/new advertisement runs before any
                 // init frame can be observed, so the first latch (or a
@@ -6531,9 +6551,11 @@ export class ClaudeAcpAgent {
                       this.toolCallCapabilities.air.client ? session.cwd : undefined,
                       session.skillPaths,
                       session.query,
+                      session.skillFiles,
                     ),
                   },
                 });
+                void this.refreshSkillFiles(params.sessionId);
                 break;
               }
               case "mirror_error": {
@@ -10997,7 +11019,52 @@ export class ClaudeAcpAgent {
       this.toolCallCapabilities.air.client ? session.cwd : undefined,
       (session.skillPaths ??= new Map()),
       session.query,
+      session.skillFiles,
     );
+  }
+
+  /**
+   * Reads the skill files from Claude Code's own skill list
+   * (`getContextUsage().skills.skillFrontmatter`) and, when they differ from
+   * the last read, re-publishes the slash commands with the skill paths. Only
+   * for AIR clients, the only ones that use the paths.
+   *
+   * Callers do not await it: the control request takes about 1 s on the first
+   * call, and it must not delay the turn or the first command list. A trigger
+   * during a running read does not start a parallel request; one more read
+   * runs after it. Errors are logged, never thrown. Older CLIs lack the method.
+   */
+  private async refreshSkillFiles(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session || !this.toolCallCapabilities.air.client) return;
+    if (typeof session.query.getContextUsage !== "function") return;
+    if (session.skillFilesRefreshing) {
+      session.skillFilesRerun = true;
+      return;
+    }
+    session.skillFilesRefreshing = true;
+    try {
+      do {
+        session.skillFilesRerun = false;
+        const usage = await session.query.getContextUsage();
+        if (this.sessions[sessionId] !== session) return;
+        const skillFiles = new Map<string, { path?: string }>();
+        for (const skill of usage.skills?.skillFrontmatter ?? []) {
+          // A prompt command of `.claude/commands` (`foo.md`) is no skill, even if Claude Code lists it here.
+          if (skill.path && path.basename(skill.path) !== "SKILL.md") continue;
+          skillFiles.set(skill.name, { path: skill.path });
+        }
+        if (JSON.stringify([...skillFiles]) !== JSON.stringify([...(session.skillFiles ?? [])])) {
+          session.skillFiles = skillFiles;
+          session.skillPaths = new Map();
+          await this.sendAvailableCommandsUpdate(sessionId);
+        }
+      } while (session.skillFilesRerun);
+    } catch (error) {
+      this.logger.error(`Failed to read the skill files: ${error}`);
+    } finally {
+      session.skillFilesRefreshing = false;
+    }
   }
 
   private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
@@ -13284,6 +13351,10 @@ function getAvailableSlashCommands(
   // The resolved SKILL.md paths of the session, keyed by the cwd and the name.
   skillPaths?: Map<string, string | undefined>,
   query?: Query,
+  // The skill files Claude Code reports (`getContextUsage().skills.skillFrontmatter`).
+  // A listed skill gets its path from here; one that is not listed, or has no
+  // path (remote connections), is looked up on disk.
+  skillFiles?: ReadonlyMap<string, { path?: string }>,
 ): AvailableCommand[] {
   // The container listings of this one pass, so a list of a hundred commands lists each container once.
   const skillScans: SkillScanCache = new Map();
@@ -13335,10 +13406,12 @@ function getAvailableSlashCommands(
       if (mcpPrompt) {
         name = `mcp:${name.replace(" (MCP)", "")}`;
       }
+      const skillFile = airSkillCwd && !mcpPrompt ? skillFiles?.get(command.name) : undefined;
       const skillMdPath =
-        airSkillCwd && !command.builtin && !mcpPrompt
+        skillFile?.path ??
+        (airSkillCwd && !command.builtin && !mcpPrompt
           ? skillPath(command.name, airSkillCwd)
-          : undefined;
+          : undefined);
       return {
         name,
         description: command.description || "",
@@ -13351,7 +13424,10 @@ function getAvailableSlashCommands(
                 skillMdPath,
               ),
             }
-          : {}),
+          : skillFile
+            ? // A skill without a file (bundled with the CLI, like `simplify`, or a remote connection): kind only.
+              { _meta: withAirMeta(undefined, AIR_KIND_KEY, "skill") }
+            : {}),
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));

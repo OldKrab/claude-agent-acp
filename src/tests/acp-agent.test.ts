@@ -13898,6 +13898,374 @@ describe("skill commands in available_commands_update", () => {
   });
 });
 
+describe("skill files from getContextUsage in available_commands_update", () => {
+  let cwd: string;
+
+  beforeEach(async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "acp-skill-files-"));
+  });
+
+  afterEach(async () => {
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  const skillEntry = (entry: Record<string, unknown>) => ({
+    skills: { skillFrontmatter: [entry] },
+  });
+
+  /** Lets the background skill file reads and their updates finish. */
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  /** One turn that emits `inits` init frames, then `changes` commands_changed frames for
+   *  `commands`. `getContextUsage` is put on the query only when given. */
+  async function runTurn(options: {
+    capabilities: Record<string, unknown>;
+    commands: Array<Record<string, unknown>>;
+    getContextUsage?: ReturnType<typeof vi.fn>;
+    inits?: number;
+    changes?: number;
+  }) {
+    const sessionUpdate = vi.fn(async () => {});
+    const logged: string[] = [];
+    const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
+      log: () => {},
+      error: (...args: unknown[]) => logged.push(args.join(" ")),
+    });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: options.capabilities });
+    async function* generator(input: Pushable<any>) {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      for (let i = 0; i < (options.inits ?? 1); i++) {
+        yield { type: "system", subtype: "init", session_id: "test-session" };
+      }
+      for (let i = 0; i < (options.changes ?? 0); i++) {
+        yield {
+          type: "system",
+          subtype: "commands_changed",
+          session_id: "test-session",
+          commands: options.commands,
+        };
+      }
+      yield {
+        type: "result",
+        subtype: "success",
+        stop_reason: null,
+        is_error: false,
+        result: "",
+        errors: [],
+        duration_ms: 0,
+        duration_api_ms: 0,
+        num_turns: 1,
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    injectGeneratorSession(agent, generator, { cwd });
+    Object.assign(agent.sessions["test-session"].query, {
+      supportedCommands: vi.fn(async () => options.commands),
+      ...(options.getContextUsage ? { getContextUsage: options.getContextUsage } : {}),
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+    await flush();
+
+    const commandUpdates = () =>
+      sessionUpdate.mock.calls
+        .map((c: any[]) => (c[0] as { update: any }).update)
+        .filter((u) => u.sessionUpdate === "available_commands_update");
+    return { commandUpdates, logged };
+  }
+
+  /** The `_meta` of the command `name` in the last available_commands_update. */
+  function lastMeta(commandUpdates: () => any[], name: string) {
+    const updates = commandUpdates();
+    return updates[updates.length - 1].availableCommands.find((c: any) => c.name === name)?._meta;
+  }
+
+  /** The air `_meta` of a skill, with a path when there is one. */
+  const skillMeta = (skillPath?: string) => ({
+    jetbrains: { air: { version: 1, kind: "skill", ...(skillPath ? { skillPath } : {}) } },
+  });
+
+  /**
+   * Scenario:
+   * 1. An AIR session lists the command `plug:pskill`.
+   * 2. getContextUsage reports it with source "plugin" and a path in the plugin directory.
+   * 3. The first init triggers the read.
+   * Expected:
+   * - The last update marks `plug:pskill` as a skill with that path.
+   */
+  it("takes the path of a plugin skill from getContextUsage", async () => {
+    const pluginSkill = "/plugins/plug/skills/pskill/SKILL.md";
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({ name: "plug:pskill", source: "plugin", pluginName: "plug", path: pluginSkill }),
+    );
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "plug:pskill", description: "Plugin skill", argumentHint: "" }],
+      getContextUsage,
+    });
+
+    expect(lastMeta(commandUpdates, "plug:pskill")).toEqual(skillMeta(pluginSkill));
+  });
+
+  /**
+   * Scenario:
+   * 1. An AIR session lists the prompt command `deploy`.
+   * 2. getContextUsage reports it with a `.claude/commands/deploy.md` path.
+   * 3. commands_changed sends the command list.
+   * Expected:
+   * - `deploy` has no `_meta`: a prompt command is no skill.
+   */
+  it("does not mark a prompt command that getContextUsage lists with a .md path", async () => {
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({
+        name: "deploy",
+        source: "projectSettings",
+        path: "/proj/.claude/commands/deploy.md",
+      }),
+    );
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "deploy", description: "Deploy", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(lastMeta(commandUpdates, "deploy")).toBeUndefined();
+  });
+
+  /**
+   * Scenario:
+   * 1. An AIR session lists the command `nested`.
+   * 2. getContextUsage lists no skills on the first read (init) and the nested one on the second.
+   * 3. commands_changed arrives after the first read.
+   * Expected:
+   * - Two reads happened.
+   * - The first update, from commands_changed, has no `_meta` on `nested`.
+   * - The last update marks `nested` with the path from the second read.
+   */
+  it("gives a nested skill reported after commands_changed its path", async () => {
+    const nestedSkill = "/proj/sub/.claude/skills/nested/SKILL.md";
+    const getContextUsage = vi
+      .fn()
+      .mockResolvedValueOnce({ skills: { skillFrontmatter: [] } })
+      .mockResolvedValue(
+        skillEntry({ name: "nested", source: "projectSettings", path: nestedSkill }),
+      );
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "nested", description: "Nested skill", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(getContextUsage).toHaveBeenCalledTimes(2);
+    expect(commandUpdates()[0].availableCommands[0]._meta).toBeUndefined();
+    expect(lastMeta(commandUpdates, "nested")).toEqual(skillMeta(nestedSkill));
+  });
+
+  /**
+   * Scenario:
+   * 1. An AIR session lists the builtin commands `simplify` and `compact`.
+   * 2. getContextUsage reports `simplify` with source "built-in" and no path; `compact` is absent.
+   * Expected:
+   * - `simplify` has kind "skill" and no skillPath.
+   * - `compact` has no `_meta`.
+   */
+  it("marks a built-in skill with the kind only and leaves compact unmarked", async () => {
+    const getContextUsage = vi.fn(async () => skillEntry({ name: "simplify", source: "built-in" }));
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [
+        { name: "simplify", description: "Simplify", argumentHint: "", builtin: true },
+        { name: "compact", description: "Compact", argumentHint: "", builtin: true },
+      ],
+      getContextUsage,
+    });
+
+    expect(lastMeta(commandUpdates, "simplify")).toEqual(skillMeta());
+    expect(lastMeta(commandUpdates, "compact")).toBeUndefined();
+  });
+
+  /**
+   * Scenario:
+   * 1. cwd/.claude/skills/review/SKILL.md exists.
+   * 2. An AIR session lists `review`; getContextUsage reports no skills.
+   * Expected:
+   * - `review` is marked as a skill with the path found in cwd/.claude/skills.
+   */
+  it("looks up a command that getContextUsage does not list on disk", async () => {
+    const reviewSkill = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
+    await mkdir(path.dirname(reviewSkill), { recursive: true });
+    await writeFile(reviewSkill, "# review\n");
+    const getContextUsage = vi.fn(async () => ({ skills: { skillFrontmatter: [] } }));
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(lastMeta(commandUpdates, "review")).toEqual(skillMeta(reviewSkill));
+  });
+
+  /**
+   * Scenario:
+   * 1. cwd/.claude/skills/review/SKILL.md exists.
+   * 2. The query has no getContextUsage.
+   * 3. An AIR session gets a commands_changed.
+   * Expected:
+   * - `review` still gets its path from the disk lookup.
+   * - No error is logged.
+   */
+  it("lists the commands as before when getContextUsage is missing", async () => {
+    const reviewSkill = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
+    await mkdir(path.dirname(reviewSkill), { recursive: true });
+    await writeFile(reviewSkill, "# review\n");
+
+    const { commandUpdates, logged } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      changes: 1,
+    });
+
+    expect(lastMeta(commandUpdates, "review")).toEqual(skillMeta(reviewSkill));
+    expect(logged.filter((line) => line.includes("skill files"))).toEqual([]);
+  });
+
+  /**
+   * Scenario:
+   * 1. cwd/.claude/skills/review/SKILL.md exists.
+   * 2. getContextUsage rejects.
+   * 3. An AIR session gets a commands_changed.
+   * Expected:
+   * - The prompt completes.
+   * - The error is logged.
+   * - `review` still gets its path from the disk lookup.
+   */
+  it("logs a failing getContextUsage and keeps the turn going", async () => {
+    const reviewSkill = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
+    await mkdir(path.dirname(reviewSkill), { recursive: true });
+    await writeFile(reviewSkill, "# review\n");
+    const getContextUsage = vi.fn(async () => {
+      throw new Error("control request failed");
+    });
+
+    const { commandUpdates, logged } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(logged.some((line) => line.includes("control request failed"))).toBe(true);
+    expect(lastMeta(commandUpdates, "review")).toEqual(skillMeta(reviewSkill));
+  });
+
+  /**
+   * Scenario:
+   * 1. A client without the AIR capability runs a turn with init and commands_changed.
+   * Expected:
+   * - getContextUsage is not called.
+   * - No command has `_meta`.
+   */
+  it("does not call getContextUsage for a client that is not AIR", async () => {
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({ name: "review", source: "projectSettings", path: "/x/SKILL.md" }),
+    );
+
+    const { commandUpdates } = await runTurn({
+      capabilities: {},
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(getContextUsage).not.toHaveBeenCalled();
+    const metas = commandUpdates().flatMap((u) => u.availableCommands.map((c: any) => c._meta));
+    expect(metas.every((meta) => meta === undefined)).toBe(true);
+  });
+
+  /**
+   * Scenario:
+   * 1. An AIR session gets three init frames and then one commands_changed.
+   * 2. Every getContextUsage read returns the same skill list.
+   * Expected:
+   * - Two updates: the one for commands_changed and the one for the first read.
+   * - getContextUsage ran exactly twice: once for init, once for commands_changed.
+   */
+  it("sends no extra update for an identical result and reads once for repeated inits", async () => {
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({ name: "review", source: "projectSettings", path: "/p/review/SKILL.md" }),
+    );
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      inits: 3,
+      changes: 1,
+    });
+
+    expect(commandUpdates()).toHaveLength(2);
+    expect(getContextUsage).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * Scenario:
+   * 1. The first getContextUsage call stays pending.
+   * 2. An AIR session gets an init and two commands_changed meanwhile.
+   * 3. The pending call then resolves.
+   * Expected:
+   * - Only one call is made while the first is pending.
+   * - After it resolves, exactly one more call is made.
+   */
+  it("coalesces triggers during a running read into one more read", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const getContextUsage = vi.fn(async () => {
+      if (getContextUsage.mock.calls.length === 1) await gate;
+      return { skills: { skillFrontmatter: [] } };
+    });
+
+    await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 2,
+    });
+    expect(getContextUsage).toHaveBeenCalledTimes(1);
+
+    release();
+
+    await vi.waitFor(() => expect(getContextUsage).toHaveBeenCalledTimes(2));
+  });
+});
+
 describe("logout", () => {
   function createMockAgent() {
     const mockClient = {
