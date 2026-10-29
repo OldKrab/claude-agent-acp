@@ -73,6 +73,15 @@ jobs:
           commit="$(git rev-parse "refs/upstream-releases/${tag}^{commit}")"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
+          # Sync PRs are squash-merged, so git cannot find the common ancestor;
+          # the release the fork last recorded is it.
+          base_tag="${tracked#"${UPSTREAM_REPOSITORY}@"}"
+          if [[ -n "$tracked" && "$base_tag" != "$tracked" ]]; then
+            git fetch --no-tags "https://github.com/${UPSTREAM_REPOSITORY}.git" \
+              "refs/tags/${base_tag}:refs/upstream-releases/${base_tag}"
+            echo "base=$(git rev-parse "refs/upstream-releases/${base_tag}^{commit}")" >> "$GITHUB_OUTPUT"
+          fi
+
           if git merge-base --is-ancestor "$commit" HEAD; then
             echo "Upstream ${tag} is already in the fork history"
             echo "required=false" >> "$GITHUB_OUTPUT"
@@ -88,6 +97,7 @@ jobs:
           BRANCH: ${{ steps.release.outputs.branch }}
           GH_TOKEN: ${{ steps.repository-token.outputs.token }}
           RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+          BASE_COMMIT: ${{ steps.release.outputs.base }}
           TAG: ${{ steps.release.outputs.tag }}
         shell: bash
         run: |
@@ -120,6 +130,7 @@ jobs:
           result=0
           node scripts/prepare-upstream-sync.mjs \
             --release "$RELEASE_COMMIT" \
+            ${BASE_COMMIT:+--base "$BASE_COMMIT"} \
             --tag "$TAG" \
             --branch "$BRANCH" || result=$?
 
