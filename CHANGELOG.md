@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.7.1...openaide-claude-agent-acp-v1.8.0) (2026-10-29)
+
+
+### Features
+
+* sync upstream v0.99.0 ([#29](https://github.com/OldKrab/claude-agent-acp/issues/29)) ([1704e14](https://github.com/OldKrab/claude-agent-acp/commit/1704e143f1c1b5be1caa9c9764abc7774e59c142))
+
 ## [1.7.1](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.7.0...openaide-claude-agent-acp-v1.7.1) (2026-10-28)
 
 
