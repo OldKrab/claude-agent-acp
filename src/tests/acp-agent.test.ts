@@ -25699,6 +25699,62 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       ]);
     });
 
+    it.each([
+      [
+        "an AIR async-tasks client",
+        { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+        true,
+      ],
+      ["a client that tracks session work", { "async-tasks": true }, false],
+    ])("gives %s the turn state the way it reads it", async (_client, meta, expectsTurnTask) => {
+      const updates: AcpSessionNotification[] = [];
+      const states: unknown[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (notification: AcpSessionNotification) => {
+            updates.push(notification);
+          },
+          extNotification: async (method: string, params: Record<string, unknown>) => {
+            if (method === "_session/state_changed") states.push(params.state);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: { _meta: meta } });
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield shellNotification();
+          yield running();
+          yield assistantText("it finished");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await agent.sessions["test-session"]?.consumer;
+
+      // Every client gets the fork's state notification for the autonomous cycle.
+      expect(states).toEqual(["running", "idle", "running", "idle"]);
+      const turnTasks = updates.filter(
+        ({ update }) =>
+          update.sessionUpdate === "async_task_spawned" && (update as any).taskType === "turn",
+      );
+      // A client that tracks session work reads the turn from the state
+      // notification alone, so a turn task would be a second signal for it.
+      expect(turnTasks).toHaveLength(expectsTurnTask ? 1 : 0);
+    });
+
     it("starts at the first output when the state never left running", async () => {
       const { agent, asyncTaskUpdates } = await airAgent();
       let wake = () => {};

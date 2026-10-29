@@ -4772,6 +4772,10 @@ export class ClaudeAcpAgent {
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       {
         notices: supportsNotices,
+        // A client that tracks the work of the session reads the turn state
+        // from `_session/state_changed`; an autonomous-turn task would show
+        // the same cycle twice, as a second background-work entry.
+        autonomousTurns: !tracksSessionWork,
         // A task that a subagent tool call started belongs to the child
         // session of that tool call, like the tool call itself. A client
         // that tracks the work of the session gets it in the root session.

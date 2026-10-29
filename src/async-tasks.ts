@@ -178,9 +178,13 @@ export class AsyncTaskRuntime {
      *  a native subagent session. `toolNameOf`: the name of the tool of a tool
      *  call, or `undefined` when the tool call is unknown. A task that a
      *  `Monitor` tool call started is published as a monitor: the SDK reports
-     *  it as `local_bash`, so the adapter names it a monitor. */
+     *  it as `local_bash`, so the adapter names it a monitor.
+     *  `autonomousTurns: false` leaves out the task of an autonomous turn
+     *  ({@link autonomousTurnStarted}), for a client that reads the turn state
+     *  from `_session/state_changed` instead. */
     private readonly options: {
       notices?: boolean;
+      autonomousTurns?: boolean;
       routeOf?: (toolCallId: string) => Route | undefined;
       toolNameOf?: (toolCallId: string) => string | undefined;
     } = {},
@@ -507,7 +511,9 @@ export class AsyncTaskRuntime {
    * already open; without it, an open task is left as it is.
    */
   async autonomousTurnStarted(cause?: string): Promise<void> {
-    if (!this.enabled) return;
+    // With no task opened, `autonomousTurnOpen` stays false, so every end and
+    // stop path for the turn is a no-op as well.
+    if (!this.enabled || this.options.autonomousTurns === false) return;
     if (this.autonomousTurn) {
       if (cause) await this.publishProgress(this.autonomousTurn, { description: cause });
       return;

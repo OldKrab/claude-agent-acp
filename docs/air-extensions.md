@@ -1009,7 +1009,8 @@ At shutdown, the adapter finishes each open task as `failed` or `stopped`.
 
 Claude Code can start a turn of its own after the prompt ended, for example to answer the notification of a finished background task.
 ACP v1 has no session state, so the adapter publishes such a turn as an async task.
-This task goes to every client with async tasks, next to the `_session/state_changed` notification that every client gets.
+A client that opts in with the `async-tasks` key does not get this task: it reads the same cycle from `_session/state_changed`, so one signal shows the turn state.
+An AIR client with `asyncTasks` gets the task.
 The task has the id `autonomous-turn-<uuid>`, the name `Claude is working`, `taskType: "turn"`, and `showInTranscript: false`.
 Its description is the summary of the last task notification, when there is one.
 The task starts at the SDK `running` state while no prompt is active or queued.
