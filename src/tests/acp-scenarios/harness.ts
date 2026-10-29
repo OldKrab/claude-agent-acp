@@ -21,8 +21,8 @@ import type {
   CreateElicitationRequest,
   RequestPermissionRequest,
   SessionNotification,
-} from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+} from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -58,6 +58,7 @@ export const AIR_CAPABILITY_NAMES = [
   "rawInputRendering",
   "planFile",
   "agentFileChangeReport",
+  "backgroundSubagents",
 ];
 
 const baseCapabilities: ClientCapabilities = {
@@ -281,6 +282,16 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
 /** The `getSessionMessages` of the SDK mock: the transcript of the active scenario. */
 export async function mockedSessionMessages(): Promise<Record<string, unknown>[]> {
   return activeScript?.transcript ?? [];
+}
+
+/** The `getSessionInfo` of the SDK mock: a stored title and modification
+ *  time for a scenario that replays a transcript, and none for a new
+ *  session, whose transcript the mock never writes. */
+export async function mockedSessionInfo(
+  sessionId: string,
+): Promise<{ sessionId: string; summary: string; lastModified: number } | undefined> {
+  if (!activeScript?.transcript.length) return undefined;
+  return { sessionId, summary: "Fix the app", lastModified: Date.UTC(2026, 0, 1) };
 }
 
 type AgentClass = new (client: any, logger?: any) => any;

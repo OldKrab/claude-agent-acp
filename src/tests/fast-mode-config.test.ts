@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { FastModeDisabledReason, ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
   buildConfigOptions,
@@ -114,7 +114,10 @@ describe("resolveFastModeEnabled", () => {
 
   it("rejects any other value", () => {
     expect(() => resolveFastModeEnabled({ ...base, value: "maybe" })).toThrow(
-      /Invalid value for config option fast/,
+      expect.objectContaining({
+        code: -32602,
+        message: expect.stringContaining("Invalid value for config option fast"),
+      }),
     );
   });
 });
