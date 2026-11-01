@@ -26594,6 +26594,49 @@ describe("turn steering (_session/steering)", () => {
     expect(JSON.stringify(injected.message.content)).toContain("also handle X");
   });
 
+  it("keeps a steer behind a prompt Claude Code has not taken yet", async () => {
+    const agent = createMockAgent();
+    const captured: any[] = [];
+    const steered = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        // An autonomous cycle is running, so the prompt waits in Claude Code's
+        // queue and is not echoed yet.
+        const prompt = await iter.next();
+        const steer = await iter.next();
+        captured.push(prompt.value, steer.value);
+        await steered.promise;
+        yield userEcho(prompt.value);
+        yield userEcho(steer.value);
+        yield createResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) > 0);
+    expect(agent.sessions["test-session"].activeTurn ?? null).toBeNull();
+
+    const steer = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    expect(steer.outcome).toBe("injected");
+    await waitFor(() => captured.length === 2);
+
+    // Equal priority keeps arrival order; `now` would overtake the prompt.
+    expect(captured[0].priority).toBeUndefined();
+    expect(captured[1].priority).toBe("next");
+    steered.resolve();
+    await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+  });
+
   /** Gives test-session a native subagent, agent-42, whose child session the client knows. */
   function announceChildSession(agent: ClaudeAcpAgent): void {
     agent.sessions["test-session"].nativeSubagentsByTaskId = new Map([
@@ -26789,17 +26832,17 @@ describe("turn steering (_session/steering)", () => {
         } as unknown as AcpClient,
         { log: () => {}, error: () => {} },
       );
+      const running = {
+        promptUuid: "running",
+        isLocalOnlyCommand: false,
+        settled: false,
+        resolve: () => {},
+        reject: () => {},
+      };
       agent.sessions["test-session"] = mockSessionState({
         input,
-        turnQueue: [
-          {
-            promptUuid: "running",
-            isLocalOnlyCommand: false,
-            settled: false,
-            resolve: () => {},
-            reject: () => {},
-          },
-        ],
+        turnQueue: [running],
+        activeTurn: running,
       });
 
       const withdrawal = new AbortController();
