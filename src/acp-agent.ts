@@ -737,6 +737,10 @@ function parseAsyncTaskStopRequest(value: unknown): AsyncTaskStopRequest {
  *  ACP request and hiding the client's user-input card (IJAI-1191). */
 const STEER_PRIORITY_NOW = "now" as const;
 const STEER_PRIORITY_LATER = "later" as const;
+/** The priority Claude Code gives a prompt, and it takes equal priorities in
+ *  arrival order. A prompt it has not echoed yet can be waiting in its queue
+ *  behind an autonomous cycle, and a `now` steer would reach the model first. */
+const STEER_PRIORITY_NEXT = "next" as const;
 
 /** Request-level steering options. `promptRequired` is opt-in so existing Hosts
  *  keep the established idle fallback behavior. */
@@ -4511,7 +4515,9 @@ export class ClaudeAcpAgent {
    *  response, or slotting in between a multi-step turn's tool calls). While a
    *  permission or elicitation is awaiting user input it uses `later`, because
    *  interrupting that SDK callback cancels the ACP request and can strand the
-   *  prompt (IJAI-1191). The steered message's own output streams via
+   *  prompt (IJAI-1191). While the turn's own prompt is not echoed yet it uses
+   *  `next`, so it stays behind that prompt in Claude Code's queue instead of
+   *  reaching the model first. The steered message's own output streams via
    *  `session/update`, not this response.
    *
    *  Pre-empting generation means ABORTING: the interrupted cycle emits a
@@ -4578,9 +4584,13 @@ export class ClaudeAcpAgent {
     const steeredUuid = randomUUID();
     userMessage.uuid = steeredUuid;
     // Deliver into the running turn rather than queuing behind it as a fresh
-    // prompt would.
+    // prompt would, but never ahead of that turn's own prompt.
     userMessage.priority =
-      (session.openUserInputs?.size ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
+      (session.openUserInputs?.size ?? 0) > 0
+        ? STEER_PRIORITY_LATER
+        : session.activeTurn === turnInFlight
+          ? STEER_PRIORITY_NOW
+          : STEER_PRIORITY_NEXT;
     // Mark before the push and in the same synchronous section as the in-flight
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
