@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.1](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.8.0...openaide-claude-agent-acp-v1.8.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* keep a steer behind a prompt Claude Code has not taken ([#33](https://github.com/OldKrab/claude-agent-acp/issues/33)) ([88989a3](https://github.com/OldKrab/claude-agent-acp/commit/88989a3cc303c6d8e12c917482e18d9247a6e32c))
+
 ## [1.8.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.7.1...openaide-claude-agent-acp-v1.8.0) (2026-10-29)
 
 
