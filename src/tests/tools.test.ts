@@ -4742,6 +4742,13 @@ describe("Skill tool rendering", () => {
       utimesSync(file, stamp, stamp);
       const before = statSync(file).mtimeMs;
       expect(skillMeta("renamed", root).path).toBeUndefined();
+      // An inode change time advances only with the kernel's clock tick, so a rewrite in the tick
+      // of the first read would leave no trace at all.
+      const { ctimeMs } = statSync(file);
+      const probe = path.join(root, "ctime-probe");
+      do {
+        writeFileSync(probe, "");
+      } while (statSync(probe).ctimeMs <= ctimeMs);
       // The rename keeps the length of the file, so only the inode change time tells the two apart.
       writeFileSync(file, "---\nname: renamed\n---\n# skill\n");
       // `git checkout`, `cp -p`, and a filesystem of one-second time resolution all leave the same trace.
