@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.1](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.10.0...openaide-claude-agent-acp-v1.10.1) (2026-11-02)
+
+
+### Bug Fixes
+
+* hold the turn open while a Workflow runs ([#40](https://github.com/OldKrab/claude-agent-acp/issues/40)) ([6c4ce5f](https://github.com/OldKrab/claude-agent-acp/commit/6c4ce5f42d0caf274a00bbe36bb907f79143f8b2))
+
 ## [1.10.0](https://github.com/OldKrab/claude-agent-acp/compare/openaide-claude-agent-acp-v1.9.0...openaide-claude-agent-acp-v1.10.0) (2026-11-02)
 
 
