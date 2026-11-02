@@ -505,6 +505,18 @@ const TOOL_USE_WAIT_MS = 2_000;
  *  a later resume (see `resumableSubagents`). */
 const MAX_RESUMABLE_SUBAGENTS = 256;
 
+/** The `task_type` of a Workflow. */
+const WORKFLOW_TASK_TYPE = "local_workflow";
+
+/** Whether a live background task keeps the turn that started it open (see
+ *  `Turn.deferredSettle`). A Workflow counts: it runs agents, so Claude Code
+ *  sends no `idle` until it ends, but its `task_started` has no
+ *  `subagent_type`. A turn that settled at its result would leave the client
+ *  no sign of the model waking for the Workflow's end. */
+function holdsItsTurn(task: { isSubagent: boolean; taskType?: string }): boolean {
+  return task.isSubagent || task.taskType === WORKFLOW_TASK_TYPE;
+}
+
 /** Removes a settled task from `liveBackgroundTasks`. A subagent keeps its
  *  parent tool call in `resumableSubagents` for a later resume. */
 function settleLiveBackgroundTask(session: Session, taskId: string): void {
@@ -1454,7 +1466,8 @@ export type Session = {
    *  tasks (e.g. a `run_in_background` dev server): those can outlive every
    *  turn, and the model's contract with them is a wake-on-exit
    *  notification, not a turn-scoped drain — a hold must NEVER wait on a
-   *  shell.
+   *  shell. A Workflow is not a subagent either, but it holds its turn for
+   *  the reason in `holdsItsTurn`.
    *
    *  `endedPerLevel` — a `background_tasks_changed` payload did not include
    *  this subagent entry. The level's universe is BACKGROUND tasks only, so
@@ -5538,7 +5551,11 @@ export class ClaudeAcpAgent {
       });
       if (parentToolUseId) forgetForegroundToolCall(session, parentToolUseId);
       session.resumableSubagents?.delete(taskId);
-      if (isSubagent && session.activeTurn && !session.activeTurn.settled) {
+      if (
+        holdsItsTurn({ isSubagent, taskType: placement.taskType }) &&
+        session.activeTurn &&
+        !session.activeTurn.settled
+      ) {
         (session.activeTurn.spawnedTaskIds ??= new Set()).add(taskId);
       }
       this.syncAwaitingUser(params.sessionId, session);
@@ -5587,13 +5604,13 @@ export class ClaudeAcpAgent {
       }
       for (const taskId of turn.spawnedTaskIds) {
         const record = session.liveBackgroundTasks.get(taskId);
-        // The isSubagent read is defense in depth for the shells-never-defer
-        // contract: spawnedTaskIds only ever holds subagent ids today, but a
-        // future add site must not silently let a long-lived shell hold a
+        // The holdsItsTurn read is defense in depth for the shells-never-defer
+        // contract: spawnedTaskIds only ever holds ids that pass it today, but
+        // a future add site must not silently let a long-lived shell hold a
         // prompt open. endedPerLevel entries are kept for attribution only —
         // the level signal says the task is gone (or its bookends were
         // lost), so a hold must not wait on them.
-        if (record?.isSubagent && !record.endedPerLevel) {
+        if (record && holdsItsTurn(record) && !record.endedPerLevel) {
           return true;
         }
       }
@@ -9130,7 +9147,7 @@ export class ClaudeAcpAgent {
   private stopBackgroundWorkflows(sessionId: string, session: Session): void {
     if (!session.stopsWorkflowsOnCancel) return;
     for (const [taskId, task] of session.liveBackgroundTasks) {
-      if (task.taskType !== "local_workflow") continue;
+      if (task.taskType !== WORKFLOW_TASK_TYPE) continue;
       session.query.stopTask(taskId).catch((error: unknown) => {
         this.logger.error(
           `Session ${sessionId}: failed to stop the background workflow ${taskId}`,

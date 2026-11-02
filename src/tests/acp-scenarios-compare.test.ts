@@ -41,6 +41,14 @@ describe("compareWithBaseline", () => {
     expect(compareWithBaseline(baseline, [toolCall, update(omit(result, "title"))])).toEqual([]);
   });
 
+  it("accepts a session state notification, which origin/main does not have", () => {
+    const stateChanged: Recorded = {
+      kind: "extNotification",
+      payload: { method: "_session/state_changed", params: { sessionId: "s", state: "idle" } },
+    };
+    expect(compareWithBaseline(baseline, [toolCall, stateChanged, update(result)])).toEqual([]);
+  });
+
   it("reports a dropped _meta key", () => {
     expect(compareWithBaseline(baseline, [toolCall, update(omit(result, "_meta"))])).toContainEqual(
       expect.stringMatching(/^origin\/main sent .*"toolName":"Read"/u),

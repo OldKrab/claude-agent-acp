@@ -10107,20 +10107,40 @@ describe("subagent permission attribution (issue #851)", () => {
         _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
       },
     });
-    injectGeneratorSession(
-      agent,
-      makeGenerator([
-        {
-          ...taskStarted("workflow-1", "toolu_workflow"),
-          task_type: "local_workflow",
-          is_backgrounded: true,
-        },
-        successResult(),
-      ]),
-    );
+    const held = Promise.withResolvers<void>();
+    const stopped = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, async function* (input) {
+      const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+      yield userEcho(userMessage);
+      yield {
+        ...taskStarted("workflow-1", "toolu_workflow"),
+        task_type: "local_workflow",
+        is_backgrounded: true,
+      };
+      yield successResult();
+      // The live Workflow holds the prompt open past its result.
+      held.resolve();
+      await stopped.promise;
+      yield {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "workflow-1",
+        tool_use_id: "toolu_workflow",
+        status: "stopped",
+        output_file: "/tmp/tasks/workflow-1.output",
+        summary: "stopped",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    });
     const query = agent.sessions["test-session"].query as any;
 
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+    const prompted = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+    await held.promise;
     query.stopTask.mockRejectedValueOnce(new Error("SDK stop failed"));
     await expect(
       agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "workflow-1" }),
@@ -10156,6 +10176,9 @@ describe("subagent permission attribution (issue #851)", () => {
       sessionUpdate: "agent_message_chunk",
       content: { type: "text" },
     });
+
+    stopped.resolve();
+    expect((await prompted).stopReason).toBe("end_turn");
   });
 
   it("takes the output path of a subagent's background Bash from its text in both orders", async () => {
@@ -23553,6 +23576,19 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     session_id: "test-session",
   });
 
+  /** A background Workflow starting. It runs agents, but Claude Code reports
+   *  it with a `task_type` and no `subagent_type`. */
+  const workflowStarted = (taskId: string) => ({
+    type: "system",
+    subtype: "task_started",
+    task_id: taskId,
+    tool_use_id: `toolu_${taskId}`,
+    description: "Review the change",
+    task_type: "local_workflow",
+    uuid: randomUUID(),
+    session_id: "test-session",
+  });
+
   const taskNotification = (taskId: string) => ({
     type: "system",
     subtype: "task_notification",
@@ -23582,6 +23618,126 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       },
       content: [{ type: "text", text }],
     },
+  });
+
+  it("holds the prompt open while a Workflow runs and resolves at the followup's result", async () => {
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield workflowStarted("workflow-1");
+        // The Workflow is still live, so the prompt must NOT resolve here.
+        yield resultMessage();
+        // Claude Code sends no idle until the Workflow ends and the model has
+        // answered it, so nothing else would tell the client it woke up.
+        yield taskNotification("workflow-1");
+        yield assistantText("workflow summary");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "review" }] })
+      .then((r) => {
+        events.push("resolved");
+        return r;
+      });
+
+    expect(response.stopReason).toBe("end_turn");
+    const summaryIndex = events.indexOf("chunk:workflow summary");
+    expect(summaryIndex).toBeGreaterThanOrEqual(0);
+    expect(summaryIndex).toBeLessThan(events.indexOf("resolved"));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("does not hold the prompt for a background command", async () => {
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield { ...workflowStarted("shell-1"), task_type: "local_bash" };
+        yield resultMessage();
+        yield idle();
+        yield taskNotification("shell-1");
+        yield running();
+        yield assistantText("after the prompt");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "build" }] })
+      .then(() => events.push("resolved"));
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(events.indexOf("resolved")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("resolved")).toBeLessThan(events.indexOf("chunk:after the prompt"));
+  });
+
+  it("settles at the idle after a Workflow stopped, which wakes no model", async () => {
+    const { agent } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield workflowStarted("workflow-1");
+        yield resultMessage();
+        yield { ...taskNotification("workflow-1"), status: "stopped" };
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "review" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("does not hold a client with backgroundSubagents for a Workflow", async () => {
+    const { agent, events } = chunkCapturingAgent();
+    await declareBackgroundSubagents(agent);
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield workflowStarted("workflow-1");
+        yield resultMessage();
+        yield taskNotification("workflow-1");
+        yield assistantText("after the prompt");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "review" }] })
+      .then(() => events.push("resolved"));
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(events.indexOf("resolved")).toBeLessThan(events.indexOf("chunk:after the prompt"));
   });
 
   it("holds the prompt open while a subagent is live and resolves at the followup's result", async () => {
