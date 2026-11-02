@@ -1164,6 +1164,20 @@ export type Session = {
    *  the command name. A `commands_changed` clears it, because the skill
    *  files can have changed then. */
   skillPaths?: Map<string, string | undefined>;
+  /** The skill files Claude Code reports in `getContextUsage().skills.skillFrontmatter`,
+   *  keyed by the skill name as the slash command is named (`plug:pskill`).
+   *  `path` is the SKILL.md file, absent for a skill bundled with the CLI and
+   *  on remote connections. Filled by
+   *  {@link ClaudeAcpAgent.refreshSkillFiles}; undefined until the first read. */
+  skillFiles?: Map<string, { path?: string }>;
+  /** True once the first `system`/init has started the first skill file read,
+   *  so the per-turn init re-emit does not start another. */
+  skillFilesRequested?: boolean;
+  /** A skill file read is running; a trigger meanwhile sets `skillFilesRerun`. */
+  skillFilesRefreshing?: boolean;
+  /** A trigger came in during a running read, which may have read the state
+   *  from before it, so one more read follows. */
+  skillFilesRerun?: boolean;
   /** Serialized `system`/init `plugin_errors` last logged, so the per-turn
    *  init re-emit logs a plugin load failure once, not every turn. */
   loggedPluginErrors?: string;
@@ -2347,6 +2361,17 @@ function isTaskNotificationRecord(message: unknown): boolean {
 }
 
 /**
+ * True when CLI error text tells the user to sign in with `/login`. The CLI
+ * words this several ways — "Not logged in · Please run /login", "Not logged
+ * in · Run /login", "Login expired · Run /login to sign in again, or
+ * re-authenticate your Anthropic profile" — so match the "run /login"
+ * instruction rather than one sentence.
+ */
+export function isLoginRequiredText(text: string): boolean {
+  return /\brun \/login\b/i.test(text);
+}
+
+/**
  * True for the synthetic assistant message the CLI injects into the transcript
  * when a turn fails authentication (e.g. "Not logged in · Please run /login",
  * "Session expired. Please run /login to sign in again."). The `/login`
@@ -2358,9 +2383,13 @@ function isTaskNotificationRecord(message: unknown): boolean {
  * session/load even after the user has logged back in.
  *
  * Takes the API message (`message.message`), which replay only knows as
- * `unknown`. The persisted record's structured `error: "authentication_failed"`
- * marker is stripped by `getSessionMessages`, so the synthetic model + text is
- * all both paths have to match on.
+ * `unknown`. The persisted record's structured `error` marker is stripped by
+ * `getSessionMessages`, and the CLI does not always set it to
+ * `authentication_failed` anyway: an expired login with no refresh token
+ * ("Login expired · Run /login to sign in again, …") arrives as
+ * `invalid_request`. So the synthetic model + text is what both paths match on.
+ * Usage-limit banners are excluded because some of them also mention `/login`
+ * (to switch accounts) and have their own handling.
  */
 export function isSyntheticLoginMessage(apiMessage: unknown): boolean {
   if (!apiMessage || typeof apiMessage !== "object") {
@@ -2375,7 +2404,8 @@ export function isSyntheticLoginMessage(apiMessage: unknown): boolean {
     !!block &&
     block.type === "text" &&
     typeof block.text === "string" &&
-    block.text.includes("Please run /login")
+    isLoginRequiredText(block.text) &&
+    !isSyntheticUsageLimitMessage(apiMessage)
   );
 }
 
@@ -2865,6 +2895,7 @@ export class ClaudeAcpAgent {
       applyUltracode: (session, enabled) => this.applyUltracode(session, enabled),
       sessionUpdate: (notification) => this.client.sessionUpdate(notification),
       supportsPlanOperations: () => this.clientCapabilities?.plan != null,
+      isAirClient: () => this.toolCallCapabilities.air.client,
       ensureConsumer: (session, id) => this.ensureConsumer(session, id),
       logError: (message, error) => this.logger.error(message, error),
       destroyReplacement: (id, session) => {
@@ -6305,6 +6336,12 @@ export class ClaudeAcpAgent {
                   message.fast_mode_state,
                   message.fast_mode_disabled_reason,
                 );
+                // The skill files are read once per session here; commands_changed
+                // reads them again. Not awaited, the read takes about a second.
+                if (!session.skillFilesRequested) {
+                  session.skillFilesRequested = true;
+                  void this.refreshSkillFiles(params.sessionId);
+                }
                 // Terminal-bound slash commands (absent when none, and on
                 // older CLIs). The session/new advertisement runs before any
                 // init frame can be observed, so the first latch (or a
@@ -6663,9 +6700,11 @@ export class ClaudeAcpAgent {
                       this.toolCallCapabilities.air.client ? session.cwd : undefined,
                       session.skillPaths,
                       session.query,
+                      session.skillFiles,
                     ),
                   },
                 });
+                void this.refreshSkillFiles(params.sessionId);
                 break;
               }
               case "mirror_error": {
@@ -7253,7 +7292,7 @@ export class ClaudeAcpAgent {
                     message.stop_reason === "refusal" ||
                     ("result" in message &&
                       message.is_error &&
-                      message.result.includes("Please run /login"));
+                      isLoginRequiredText(message.result));
                   if (goalCommandFailed) {
                     await this.publishGoal(params.sessionId, pendingGoalUpdate.previous ?? null);
                   }
@@ -7484,7 +7523,7 @@ export class ClaudeAcpAgent {
               // drained hold at their results is as good as the idle
               // fallback.) Then stop: everything below is user-turn
               // lifecycle, and an autonomous outcome must never touch it —
-              // its is_error or "Please run /login" text would otherwise
+              // its is_error or "run /login" text would otherwise
               // failActive a live turn (the held one, or the user's next
               // prompt) whose own result recorded a different outcome.
               if (isAutonomousResult) {
@@ -7771,7 +7810,7 @@ export class ClaudeAcpAgent {
 
               switch (message.subtype) {
                 case "success": {
-                  if (message.is_error && message.result.includes("Please run /login")) {
+                  if (message.is_error && isLoginRequiredText(message.result)) {
                     await failActiveWithSessionFailure(
                       "auth_required",
                       RequestError.authRequired(),
@@ -9865,7 +9904,7 @@ export class ClaudeAcpAgent {
         replaySession.messageIdToUuid.set(replayMessageId, message.uuid);
       }
 
-      // The live prompt loop converts the synthetic "Please run /login"
+      // The live prompt loop converts the synthetic "run /login"
       // assistant message into an authRequired error instead of showing its
       // TUI-specific text; skip it on replay too (issue #863).
       if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
@@ -11168,7 +11207,52 @@ export class ClaudeAcpAgent {
       this.toolCallCapabilities.air.client ? session.cwd : undefined,
       (session.skillPaths ??= new Map()),
       session.query,
+      session.skillFiles,
     );
+  }
+
+  /**
+   * Reads the skill files from Claude Code's own skill list
+   * (`getContextUsage().skills.skillFrontmatter`) and, when they differ from
+   * the last read, re-publishes the slash commands with the skill paths. Only
+   * for AIR clients, the only ones that use the paths.
+   *
+   * Callers do not await it: the control request takes about 1 s on the first
+   * call, and it must not delay the turn or the first command list. A trigger
+   * during a running read does not start a parallel request; one more read
+   * runs after it. Errors are logged, never thrown. Older CLIs lack the method.
+   */
+  private async refreshSkillFiles(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session || !this.toolCallCapabilities.air.client) return;
+    if (typeof session.query.getContextUsage !== "function") return;
+    if (session.skillFilesRefreshing) {
+      session.skillFilesRerun = true;
+      return;
+    }
+    session.skillFilesRefreshing = true;
+    try {
+      do {
+        session.skillFilesRerun = false;
+        const usage = await session.query.getContextUsage();
+        if (this.sessions[sessionId] !== session) return;
+        const skillFiles = new Map<string, { path?: string }>();
+        for (const skill of usage.skills?.skillFrontmatter ?? []) {
+          // A prompt command of `.claude/commands` (`foo.md`) is no skill, even if Claude Code lists it here.
+          if (skill.path && path.basename(skill.path) !== "SKILL.md") continue;
+          skillFiles.set(skill.name, { path: skill.path });
+        }
+        if (JSON.stringify([...skillFiles]) !== JSON.stringify([...(session.skillFiles ?? [])])) {
+          session.skillFiles = skillFiles;
+          session.skillPaths = new Map();
+          await this.sendAvailableCommandsUpdate(sessionId);
+        }
+      } while (session.skillFilesRerun);
+    } catch (error) {
+      this.logger.error(`Failed to read the skill files: ${error}`);
+    } finally {
+      session.skillFilesRefreshing = false;
+    }
   }
 
   private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
@@ -13502,6 +13586,10 @@ function getAvailableSlashCommands(
   // The resolved SKILL.md paths of the session, keyed by the cwd and the name.
   skillPaths?: Map<string, string | undefined>,
   query?: Query,
+  // The skill files Claude Code reports (`getContextUsage().skills.skillFrontmatter`).
+  // A listed skill gets its path from here; one that is not listed, or has no
+  // path (remote connections), is looked up on disk.
+  skillFiles?: ReadonlyMap<string, { path?: string }>,
 ): AvailableCommand[] {
   // The container listings of this one pass, so a list of a hundred commands lists each container once.
   const skillScans: SkillScanCache = new Map();
@@ -13553,10 +13641,12 @@ function getAvailableSlashCommands(
       if (mcpPrompt) {
         name = `mcp:${name.replace(" (MCP)", "")}`;
       }
+      const skillFile = airSkillCwd && !mcpPrompt ? skillFiles?.get(command.name) : undefined;
       const skillMdPath =
-        airSkillCwd && !command.builtin && !mcpPrompt
+        skillFile?.path ??
+        (airSkillCwd && !command.builtin && !mcpPrompt
           ? skillPath(command.name, airSkillCwd)
-          : undefined;
+          : undefined);
       return {
         name,
         description: command.description || "",
@@ -13569,7 +13659,10 @@ function getAvailableSlashCommands(
                 skillMdPath,
               ),
             }
-          : {}),
+          : skillFile
+            ? // A skill without a file (bundled with the CLI, like `simplify`, or a remote connection): kind only.
+              { _meta: withAirMeta(undefined, AIR_KIND_KEY, "skill") }
+            : {}),
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
@@ -14295,7 +14388,12 @@ export function toAcpNotifications(
             !("is_error" in chunk && chunk.is_error)
           ) {
             const plan = approvedPlan(toolUse.input, toolUseResult);
-            if (plan) approvedPlanUpdate = planModeUpdate(plan);
+            if (plan) {
+              approvedPlanUpdate = planModeUpdate(
+                plan,
+                renderer.capabilities.air.client ? toolUse.id : undefined,
+              );
+            }
           }
           update = finalUpdate;
         }
