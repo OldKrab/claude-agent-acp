@@ -1650,6 +1650,7 @@ Claude Code sends the result of the turn when the main agent stops, also while s
 
 A client that does not declare `backgroundSubagents` gets the hold of issues #864 and #866.
 The adapter keeps the `session/prompt` request open while a subagent that the turn started or resumed runs.
+A Workflow that the turn started holds it the same way, because Claude Code sends no `idle` until a Workflow ends. A background command holds no turn.
 The subagent output, its permission requests and the followup summary of the model then go out inside the turn.
 The turn ends at the followup result, at an `idle` with no live subagent, at `session/cancel`, or when the next prompt starts.
 The hold protects a client that stops listening at the prompt response.

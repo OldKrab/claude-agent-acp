@@ -33,6 +33,8 @@
  *   that the tool result does not say (see `CommandOutput.exitCode`): 1 for a
  *   failure that names no code or an interrupted command, 0 for a
  *   backgrounded command.
+ * - A `_session/state_changed` notification is an extension that origin/main
+ *   does not have (see {@link withoutSessionStateNotifications}).
  */
 import type { Recorded } from "./harness.js";
 
@@ -147,6 +149,15 @@ function withoutSandboxNetworkSettlements(traffic: Recorded[]): Recorded[] {
   });
 }
 
+/** `traffic` without the session state notifications of the adapter. */
+function withoutSessionStateNotifications(traffic: Recorded[]): Recorded[] {
+  return traffic.filter(
+    (record) =>
+      record.kind !== "extNotification" ||
+      (record.payload as { method: string }).method !== "_session/state_changed",
+  );
+}
+
 /** A copy of `value` without `key`. */
 function without(value: Json, key: string): Json {
   const copy = { ...value };
@@ -253,8 +264,10 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
       const update = updateOf(record);
       return !(update?.sessionUpdate === "session_info_update" && Object.keys(update).length === 1);
     });
-  const current = withoutSandboxNetworkSettlements(
-    traffic.map((record) => withoutSessionCapability(record, "systemPrompt")),
+  const current = withoutSessionStateNotifications(
+    withoutSandboxNetworkSettlements(
+      traffic.map((record) => withoutSessionCapability(record, "systemPrompt")),
+    ),
   );
   const violations: string[] = [];
   const state = new Map<string, Map<string, string>>();

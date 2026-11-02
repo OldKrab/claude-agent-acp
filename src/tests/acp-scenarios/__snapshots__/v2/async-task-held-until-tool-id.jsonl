@@ -4,3 +4,4 @@
 {"kind":"response","method":"session/prompt","payload":{"messageId":"<id-1>"}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"background":[],"sessionUpdate":"state_update","state":"running"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"_meta":{"quota":{"model_usage":[],"token_count":{"cachedInputTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":0}}},"background":[],"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn","usage":{"cachedReadTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"totalTokens":0}}}}
+{"kind":"notification","method":"_session/state_changed","payload":{"sessionId":"<session>","state":"idle"}}

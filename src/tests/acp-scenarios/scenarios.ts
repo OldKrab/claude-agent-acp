@@ -16,6 +16,13 @@ import {
 
 const bashInput = { command: "ls -la", description: "List files" };
 
+/** A Workflow stopped after its turn's result. A live Workflow holds the prompt
+ *  open, and Claude Code says idle only once it ended. */
+function* workflowStopped(taskId: string) {
+  yield system("task_notification", { task_id: taskId, status: "stopped", summary: "stopped" });
+  yield system("session_state_changed", { state: "idle" });
+}
+
 export const SCENARIOS: Scenario[] = [
   {
     name: "session-setup",
@@ -138,6 +145,7 @@ export const SCENARIOS: Scenario[] = [
           usage: { total_tokens: 0, tool_uses: 0, duration_ms: 6 },
         });
         yield result();
+        yield* workflowStopped("workflow_3");
       },
     ],
   },
@@ -172,6 +180,7 @@ export const SCENARIOS: Scenario[] = [
           description: "Build assets",
         });
         yield result();
+        yield* workflowStopped("workflow_2");
       },
     ],
   },
