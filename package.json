@@ -86,5 +86,5 @@
     "typescript": "6.0.3",
     "vitest": "5.0.5"
   },
-  "openaideUpstream": "agentclientprotocol/claude-agent-acp@v0.99.0"
+  "openaideUpstream": "agentclientprotocol/claude-agent-acp@v0.99.1"
 }
