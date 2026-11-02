@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { CreateElicitationResponse } from "@agentclientprotocol/sdk/unstable";
 import type {
   CreateElicitationRequest,
-  ElicitationAcceptAction,
+  CreateElicitationResponse,
   ElicitationPropertySchema,
   ElicitationSchema,
   EnumOption,
@@ -75,17 +74,22 @@ export function mcpElicitationToCreateRequest(
 }
 
 /**
- * Content of an accepted elicitation response.
+ * Content of an accepted elicitation response, or `{}` when the response is
+ * no accept or its `content` is no JSON object.
  *
- * Uses the SDK's validating guard rather than an `action === "accept"` check:
- * the guard both narrows past the union's custom/future variant and validates
- * the payload, so a malformed accept (right tag, ill-typed content) yields
- * empty content — the same classification the SDK's wire validators apply.
+ * The values are not checked. v1 allows a string, number, boolean, or string
+ * array; v2 also allows any other JSON value, such as an object. An MCP
+ * server checks the content against its own `requestedSchema`, so it gets the
+ * content as the client sent it: before, an accept whose content held an
+ * object reached the server as `{ action: "accept", content: {} }`. Callers
+ * that read a field must check its type.
  */
-function acceptedElicitationContent(
-  response: CreateElicitationResponse,
-): NonNullable<ElicitationAcceptAction["content"]> {
-  return CreateElicitationResponse.isAccept(response) ? (response.content ?? {}) : {};
+function acceptedElicitationContent(response: CreateElicitationResponse): Record<string, unknown> {
+  if (response.action !== "accept") return {};
+  const content: unknown = (response as { content?: unknown }).content;
+  return content !== null && typeof content === "object" && !Array.isArray(content)
+    ? (content as Record<string, unknown>)
+    : {};
 }
 
 /**
@@ -97,7 +101,11 @@ export function createElicitationResponseToElicitResult(
 ): ElicitationResult {
   switch (response.action) {
     case "accept":
-      return { action: "accept", content: acceptedElicitationContent(response) };
+      // `ElicitResult` types the values as v1 does. The MCP server checks them.
+      return {
+        action: "accept",
+        content: acceptedElicitationContent(response) as ElicitationResult["content"],
+      };
     case "decline":
       return { action: "decline" };
     case "cancel":
@@ -295,7 +303,7 @@ export function applyAskElicitationResponse(
   questions: AskUserQuestion[],
   options: { reportUnanswered?: boolean } = {},
 ): AskUserQuestionOutcome {
-  // Typed against the output schema: as of SDK 0.3.312 only it lists
+  // Typed against the output schema: as of SDK 0.3.316 only it lists
   // `unanswered`, though the tool reads the same annotations from its input.
   const annotations: NonNullable<AskUserQuestionOutput["annotations"]> = {};
   const withAnnotations = (answers: AskUserQuestionOutput["answers"]) => ({
@@ -325,13 +333,13 @@ export function applyAskElicitationResponse(
     const custom = content[questionCustomFieldKey(index)];
     const customText = typeof custom === "string" ? custom.trim() : "";
 
+    // A pick is a string, number, or boolean. Other values, such as an object
+    // that a v2 client may send, are dropped instead of read as "[object Object]".
     const value = content[questionFieldKey(index)];
-    const picks: string[] =
-      value === undefined || value === null
-        ? []
-        : Array.isArray(value)
-          ? value.filter((item) => item !== undefined && item !== null && item !== "").map(String)
-          : [String(value)];
+    const picks: string[] = (Array.isArray(value) ? value : [value])
+      .filter(isElicitationScalar)
+      .map(String)
+      .filter((item) => item !== "");
 
     // A multi-select is additive, and the form offers the selection and the
     // custom box as independent fields — a user who fills both means both, so
@@ -374,10 +382,16 @@ export function applyAskElicitationResponse(
   return { action: "answered", updatedInput: withAnnotations(answers) };
 }
 
+function isElicitationScalar(value: unknown): value is string | number | boolean {
+  return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+}
+
 /**
  * Coerce an arbitrary MCP `requestedSchema` into an ACP `ElicitationSchema`.
  * The two are structurally compatible JSON Schemas; we just guarantee the
- * `type: "object"` discriminator is present.
+ * `type: "object"` discriminator and a `properties` map are present. The v2
+ * schema requires both, so a client on SDK 2.2.0 or later rejects an MCP
+ * schema such as `{ type: "object" }` that has no `properties`.
  */
 function normalizeElicitationSchema(
   schema: Record<string, unknown> | undefined,
@@ -385,7 +399,8 @@ function normalizeElicitationSchema(
   if (!schema || typeof schema !== "object") {
     return { type: "object", properties: {} };
   }
-  return { ...(schema as ElicitationSchema), type: "object" };
+  const { properties } = schema as Partial<ElicitationSchema>;
+  return { ...(schema as ElicitationSchema), type: "object", properties: properties ?? {} };
 }
 
 /**

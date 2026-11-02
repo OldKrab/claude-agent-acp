@@ -10,6 +10,7 @@ import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-age
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { ALLOW_BYPASS } from "../permissions/modes.js";
 import { NativeSubagentRuntime } from "../native-subagents.js";
+import { startupFailure } from "./helpers.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -319,6 +320,61 @@ describe("createSession options merging", () => {
         .filter(({ update }) => update.sessionUpdate === "config_option_update")
         .every(({ sessionId: target }) => target === "child"),
     ).toBe(true);
+  });
+
+  it("reports a worktree child's cwd from its SubagentStart hook, and none for a child in the session's cwd", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const client = createMockClient();
+    client.sessionUpdate = async (notification) => {
+      updates.push(notification);
+    };
+    const observedAgent = new ClaudeAcpAgent(client);
+    await observedAgent.initialize({ protocolVersion: 1, clientCapabilities: { subagents: {} } });
+    const { sessionId } = await observedAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const session = observedAgent.sessions[sessionId]!;
+    const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
+      "rfd",
+      sessionId,
+      session,
+      (notification) => client.sessionUpdate(notification),
+      { log: () => {} },
+    ));
+    const subagentStart = async (agentId: string, cwd: string) => {
+      const matcher = capturedOptions!.hooks!.SubagentStart!.find((matcher) => !matcher.matcher);
+      for (const hook of matcher!.hooks) {
+        await hook(
+          {
+            hook_event_name: "SubagentStart",
+            session_id: sessionId,
+            cwd,
+            transcript_path: "/tmp/transcript",
+            agent_id: agentId,
+            agent_type: "general-purpose",
+          },
+          undefined,
+          { signal: new AbortController().signal },
+        );
+      }
+    };
+    const worktree = path.join(process.cwd(), ".claude", "worktrees", "agent-isolated");
+    await subagentStart("isolated", worktree);
+    await subagentStart("shared", process.cwd());
+    await runtime.taskStarted(
+      { taskId: "isolated", subagentType: "general-purpose" },
+      async () => {},
+    );
+    await runtime.taskStarted(
+      { taskId: "shared", subagentType: "general-purpose" },
+      async () => {},
+    );
+    const announcements = updates.flatMap(({ update }) =>
+      update.sessionUpdate === "subagent_update" ? [update] : [],
+    );
+    expect(announcements).toMatchObject([
+      { sessionId: "isolated", cwd: worktree },
+      { sessionId: "shared" },
+    ]);
+    expect(announcements[1]).not.toHaveProperty("cwd");
   });
 
   it("reports an AIR child's model switch under its current generation", async () => {
@@ -1343,6 +1399,36 @@ describe("createSession options merging", () => {
 
     it("accepts an existing absolute directory", async () => {
       await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).resolves.toBeDefined();
+    });
+  });
+
+  describe("startup failures", () => {
+    it("asks Claude Code to report why it could not start", async () => {
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions?.env?.CLAUDE_CODE_STARTUP_FAILURE_RESULTS).toBe("1");
+    });
+
+    it.each([
+      ["proxy_invalid", RequestError.internalError().code, "Internal error"],
+      ["gateway_signin_required", RequestError.authRequired().code, "Authentication required"],
+      ["org_pin_mismatch", RequestError.authRequired().code, "Authentication required"],
+      ["org_config_refused", RequestError.authRequired().code, "Authentication required"],
+      ["cwd_unavailable", RequestError.invalidParams().code, "Invalid params"],
+    ])("rejects with %s as code %i", async (reason, code, prefix) => {
+      initError = startupFailure(reason, "Fix the setting and restart Claude Code.");
+      await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toMatchObject({
+        code,
+        message: `${prefix}: Fix the setting and restart Claude Code.`,
+        data: { startupFailureReason: reason },
+      });
+      expect(closeSpy).toHaveBeenCalled();
+    });
+
+    it("passes on an exit error that names no reason", async () => {
+      initError = new Error("Claude Code process exited with code 1. stderr: boom");
+      await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toBe(
+        initError,
+      );
     });
   });
 
