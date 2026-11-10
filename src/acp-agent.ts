@@ -106,6 +106,7 @@ import {
   toGoalSnapshot,
 } from "./goal-extension.js";
 import { blobResourceToClaude } from "./blob-resources.js";
+import { checklistPlanUpdate, resetPlanUpdates } from "./plans.js";
 import { promptSuggestionsMeta, promptSuggestionText } from "./prompt-suggestions.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
@@ -165,22 +166,15 @@ import {
   clientSupportsAsyncTasks,
   clientTracksSessionWork,
   rootSessionRoute,
+  taskProgressFields,
 } from "./async-tasks.js";
+import { workflowSnapshot } from "./workflow-progress.js";
 import {
-  backgroundLevel,
-  type BackgroundLevel,
   type BackgroundSink,
-  backgroundToolCallPause,
-  backgroundToolCallStates,
   type BackgroundTaskEnd,
-  type BackgroundToolCall,
   BackgroundWorkReporter,
   cancelBackgroundWork,
-  droppedTasks,
-  endBackgroundWork,
-  registerBackgroundToolCalls,
-  takeBackgroundTerminalExit,
-  takeBackgroundToolCallEnd,
+  SessionBackgroundWork,
 } from "./background-work.js";
 import {
   AUTH_STATUS_PROBE_TIMEOUT_MS,
@@ -195,6 +189,8 @@ import {
   notLoggedInAuthStatus,
   sameAuthStatus,
 } from "./auth-status.js";
+import { agentCommand } from "./agent-command.js";
+import { claudeCliPath } from "./claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -242,7 +238,7 @@ import {
   type ResumedSessionSnapshot,
 } from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
-import { ALLOW_BYPASS } from "./permissions/modes.js";
+import { ALLOW_BYPASS, autoModeDisabled } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
 import {
@@ -292,8 +288,10 @@ import {
   failedCompactionStatus,
   isCompactSummaryMessage,
 } from "./context-compaction.js";
+import { IdleCompaction } from "./idle-compaction.js";
 import {
   clientSupportsNotices,
+  collapseHookSpeaker,
   MAX_NOTICE_TITLE_LENGTH,
   normalizeNoticeText,
   noticeOrTranscriptUpdate,
@@ -379,6 +377,7 @@ import {
   SessionModeManager,
 } from "./session-mode.js";
 import {
+  aliasResumedModelRow,
   applyAvailableModelsAllowlist,
   buildModelConfigOption,
   getAvailableModels,
@@ -831,6 +830,11 @@ function parseSteerRequest(params: unknown): SteerRequest {
     _meta: _meta as SteerMeta | null | undefined,
   };
 }
+
+/** Who started a turn. `idleCompaction` is the adapter's own `/compact` (see
+ *  `IdleCompaction`): it is not a user prompt, so it neither disarms idle
+ *  compaction, asks for a title from its prompt, nor clears the published prompt suggestion. */
+type TurnOrigin = "client" | "idleCompaction";
 
 /** One in-flight turn, started by `startTurn()`. A persistent per-session
  *  consumer (see `runConsumer`) drains the SDK query stream for the whole
@@ -1516,30 +1520,17 @@ export type Session = {
    *  to stop each one itself. A client that can cancel one subagent gets the
    *  declaration, but it has no control for a workflow unless it is AIR with
    *  `asyncTasks` (`_session/async_task/stop`), or gets the session's
-   *  background work (`reportsBackground`, with `tool_call/cancel`), which
+   *  background work (`background.reported`, with `tool_call/cancel`), which
    *  `session/cancel` must leave running. So for any other such client the
    *  adapter stops the workflows after the interrupt, as the interrupt did
    *  before. */
   stopsWorkflowsOnCancel?: boolean;
-  /** The display terminals of the commands that went to the background and
-   *  still run, by the id of the command's task: the Bash tool call whose
-   *  terminal it is, and the subagent tool call that ran it, if any. The
-   *  terminal exits when the task ends, not at the tool result (see
-   *  `withRunningTerminal`). Only for a client that renders terminals and is
-   *  not AIR, which shows the command through its async tasks. */
-  backgroundTerminals?: Map<string, { toolCallId: string; parentToolUseId?: string }>;
-  /** The tool calls whose tasks went on in the background and still run, by
-   *  task id: a Monitor, a Workflow, or a backgrounded MCP call. The tool call
-   *  stays `in_progress` (or `paused`) after its result, until its task ends
-   *  (see `withRunningToolCall`). Only while `reportsBackground`. */
-  backgroundToolCalls?: Map<string, BackgroundToolCall>;
-  /** Whether the client gets the session's background work (see
-   *  `background-work.ts`). Only when Claude Code's interrupt spares
-   *  background tasks, as `perTaskStopAffordance` makes it. */
-  reportsBackground?: boolean;
-  /** Claude Code's live background task set, from its last
-   *  `background_tasks_changed`. Per CLI process, as is a session. */
-  backgroundLevel?: BackgroundLevel;
+  /** The tasks that Claude Code runs in the background for the session: the
+   *  terminals of commands, kept for a client that renders terminals and is
+   *  not AIR (AIR shows a command through its async tasks), and, when the
+   *  client gets the session's background work, the tool calls of tasks and
+   *  the `background` lists. Per CLI process, as is a session. */
+  background: SessionBackgroundWork;
   /** The parent tool call of each subagent that a settle bookend removed from
    *  `liveBackgroundTasks`. The SDK can resume such a subagent under the same
    *  agent id without a new `task_started` (a running `task_updated` patch or
@@ -1580,6 +1571,8 @@ export type Session = {
   /** The consumer's compaction lifecycle, exposed so the PostCompact hook can
    *  hand it the retained summary. */
   contextCompaction?: ContextCompactionLifecycle;
+  /** Compacts the session shortly before its one-hour prompt cache expires. */
+  idleCompaction?: IdleCompaction;
   /** Whether any top-level assistant text reached the client since the last
    *  stretch boundary. Set as a side effect of sending in the consumer's
    *  `sendUpdate`, never at an emission site; read at the terminal `result`
@@ -2222,54 +2215,6 @@ function recoveredToolInput(prefix: string): Record<string, unknown> | undefined
   } catch {
     return undefined;
   }
-}
-
-export async function claudeCliPath(): Promise<string> {
-  if (process.env.CLAUDE_CODE_EXECUTABLE) {
-    return process.env.CLAUDE_CODE_EXECUTABLE;
-  }
-  // The SDK's CLI is a native binary shipped as a platform-specific optional
-  // dependency of @anthropic-ai/claude-agent-sdk. Resolve via a require bound
-  // to the SDK so nested installs are found even when npm doesn't hoist.
-  const { createRequire } = await import("node:module");
-  const req = createRequire(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
-  const ext = process.platform === "win32" ? ".exe" : "";
-  // On linux, both glibc and musl variants may be installed side-by-side
-  // (e.g. bunx hydrates every optional dep), so picking one by trial is
-  // unreliable: the wrong binary segfaults at runtime instead of failing to
-  // spawn. Detect the runtime libc and prefer the matching variant, falling
-  // back to the other only if the preferred one isn't installed.
-  const candidates =
-    process.platform === "linux"
-      ? isMuslLibc()
-        ? [
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
-          ]
-        : [
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
-          ]
-      : [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/claude${ext}`];
-  for (const candidate of candidates) {
-    try {
-      return req.resolve(candidate);
-    } catch {
-      // try next candidate
-    }
-  }
-  throw new Error(
-    `Claude native binary not found for ${process.platform}-${process.arch}. ` +
-      `Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.`,
-  );
-}
-
-function isMuslLibc(): boolean {
-  // process.report.getReport().header.glibcVersionRuntime is populated when
-  // Node is dynamically linked against glibc, and absent on musl.
-  const report = process.report?.getReport() as
-    { header?: { glibcVersionRuntime?: string } } | undefined;
-  return !report?.header?.glibcVersionRuntime;
 }
 
 /** Returned to clients when a prompt or cancel targets a session whose SDK
@@ -3090,10 +3035,11 @@ export class ClaudeAcpAgent {
       };
 
       if (supportsMetaTerminalAuth) {
+        const agent = agentCommand();
         remoteLoginMethod._meta = {
           "terminal-auth": {
-            command: process.execPath,
-            args: [...process.argv.slice(1), "--cli"],
+            command: agent.command,
+            args: [...agent.args, "--cli"],
             label: "Claude Login",
           },
         };
@@ -3120,18 +3066,18 @@ export class ClaudeAcpAgent {
       };
 
       if (supportsMetaTerminalAuth) {
-        const baseArgs = process.argv.slice(1);
+        const agent = agentCommand();
         claudeLoginMethod._meta = {
           "terminal-auth": {
-            command: process.execPath,
-            args: [...baseArgs, "--cli", "auth", "login", "--claudeai"],
+            command: agent.command,
+            args: [...agent.args, "--cli", "auth", "login", "--claudeai"],
             label: "Claude Login",
           },
         };
         consoleLoginMethod._meta = {
           "terminal-auth": {
-            command: process.execPath,
-            args: [...baseArgs, "--cli", "auth", "login", "--console"],
+            command: agent.command,
+            args: [...agent.args, "--cli", "auth", "login", "--console"],
             label: "Anthropic Console Login",
           },
         };
@@ -3860,7 +3806,7 @@ export class ClaudeAcpAgent {
         cwd: os.tmpdir(),
         settingSources: [],
         persistSession: false,
-        pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
+        pathToClaudeCodeExecutable: await claudeCliPath(),
       },
     });
   }
@@ -4051,7 +3997,7 @@ export class ClaudeAcpAgent {
    * `promptToClaude` would drop it. v2 prompts reach `startTurn` through
    * `v1PromptRequest`, which rejects these blocks itself.
    */
-  async prompt(params: PromptRequest): Promise<PromptResponse> {
+  async prompt(params: PromptRequest, origin: TurnOrigin = "client"): Promise<PromptResponse> {
     for (const block of params.prompt) {
       if (!SUPPORTED_PROMPT_CONTENT_TYPES.includes(block.type)) {
         throw RequestError.invalidParams(
@@ -4064,7 +4010,7 @@ export class ClaudeAcpAgent {
     const outcome = new Promise<TurnOutcome>((resolve, reject) => {
       events = { inserted() {}, ended: resolve, failed: reject };
     });
-    await this.startTurn(params, events);
+    await this.startTurn(params, events, origin);
     return outcome;
   }
 
@@ -4074,7 +4020,15 @@ export class ClaudeAcpAgent {
    * on, `events` reports how the turn goes (see {@link TurnEvents}), possibly
    * before this resolves.
    */
-  async startTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
+  async startTurn(
+    params: PromptRequest,
+    events: TurnEvents,
+    origin: TurnOrigin = "client",
+  ): Promise<void> {
+    // Before the first await below: a timer that fires during those awaits
+    // would queue `/compact` right behind this prompt. The idle compaction's
+    // own turn comes from that timer, which is already cleared.
+    if (origin === "client") this.sessions[params.sessionId]?.idleCompaction?.disarm("prompt");
     const received = ++this.promptsReceived;
     while (this.providerUpdate) await this.providerUpdate;
     let session = this.sessions[params.sessionId];
@@ -4126,10 +4080,7 @@ export class ClaudeAcpAgent {
       // around it. Refuse instead of interleaving. `foregroundWork` also covers
       // a cycle that Claude Code started on its own, such as its follow-up
       // after a background subagent finished, which is not in `turnQueue`.
-      if (
-        this.foregroundWork.has(params.sessionId) ||
-        (session.turnQueue ?? []).some((turn) => !turn.settled)
-      ) {
+      if (this.claudeIsWorking(params.sessionId, session)) {
         throw RequestError.invalidRequest(
           undefined,
           "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
@@ -4193,18 +4144,22 @@ export class ClaudeAcpAgent {
     const localCommand = this.localCommandMarkdown(params);
     const localCommandAbort = localCommand ? new AbortController() : undefined;
 
-    session.titles.onPrompt(params.prompt);
+    // An idle compaction is not something the user sent: it must not title the
+    // session `/compact` or spend the prediction the user is still looking at.
+    if (origin === "client") {
+      session.titles.onPrompt(params.prompt);
 
-    // The prompt the previous turn predicted is spent: the user either sent it
-    // or sent something else. Clearing it here keeps a turn that predicts
-    // nothing (the CLI predicts none in plan mode, after an API error, or at
-    // the usage limit) from leaving the stale prediction in the composer. A
-    // session that holds no prediction needs no clear, and the prompt path
-    // then keeps the ordering it has without this feature.
-    if (session.lastPublishedPromptSuggestion != null) {
-      await this.publishPromptSuggestion(params.sessionId, null);
-    } else {
-      session.promptSuggestionExpected = false;
+      // The prompt the previous turn predicted is spent: the user either sent it
+      // or sent something else. Clearing it here keeps a turn that predicts
+      // nothing (the CLI predicts none in plan mode, after an API error, or at
+      // the usage limit) from leaving the stale prediction in the composer. A
+      // session that holds no prediction needs no clear, and the prompt path
+      // then keeps the ordering it has without this feature.
+      if (session.lastPublishedPromptSuggestion != null) {
+        await this.publishPromptSuggestion(params.sessionId, null);
+      } else {
+        session.promptSuggestionExpected = false;
+      }
     }
 
     // A `/remote-control` command still in flight answers into the session's
@@ -4262,7 +4217,7 @@ export class ClaudeAcpAgent {
     (session.sentUserUuids ??= new Set()).add(promptUuid);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
-    session.titles.onPromptQueued(session, params.prompt);
+    if (origin === "client") session.titles.onPromptQueued(session, params.prompt);
     // The prompt is queued, so its turn goes ahead even if the client misses
     // the goal it sets; the turn's events report the outcome.
     await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid).catch((error) =>
@@ -4609,7 +4564,7 @@ export class ClaudeAcpAgent {
     if (!entries) return;
     await this.client.sessionUpdate({
       sessionId,
-      update: { sessionUpdate: "plan", entries },
+      update: checklistPlanUpdate(entries, this.clientCapabilities?.plan != null),
     });
   }
 
@@ -4744,6 +4699,7 @@ export class ClaudeAcpAgent {
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
     // (see Turn.steeredEchoes).
+    session.idleCompaction?.disarm("steer");
     (turnInFlight.steeredEchoes ??= new Set()).add(steeredUuid);
     (turnInFlight.steeredUuids ??= new Set()).add(steeredUuid);
     // A turn already held for background subagents has a recorded outcome the
@@ -4817,6 +4773,8 @@ export class ClaudeAcpAgent {
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
+    // A rate_limit_event that came before the turn had any usage to report.
+    let pendingRateLimit: unknown = null;
     // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
     // problem, billing), it sets a categorical `error` field on the
     // `SDKAssistantMessage` that precedes the final `result` message. We capture
@@ -5132,7 +5090,8 @@ export class ClaudeAcpAgent {
     };
 
     // ACP's usage_update has no model field, so the model the usage belongs
-    // to rides in `_meta` alongside the other `_claude/*` keys.
+    // to rides in `_meta` alongside the other `_claude/*` keys, as does a
+    // pending rate limit.
     const attachUsageModel = <
       T extends {
         sessionUpdate: "usage_update";
@@ -5143,6 +5102,13 @@ export class ClaudeAcpAgent {
     >(
       update: T,
     ): T => {
+      if (pendingRateLimit !== null) {
+        update = {
+          ...update,
+          _meta: { "_claude/rateLimit": pendingRateLimit, ...(update._meta ?? {}) },
+        };
+        pendingRateLimit = null;
+      }
       if (!lastAssistantModel) return update;
       return {
         ...update,
@@ -5561,16 +5527,10 @@ export class ClaudeAcpAgent {
       this.syncAwaitingUser(params.sessionId, session);
     };
 
-    /** Ends the display terminal of a command that went to the background, and
-     *  gives a tool call whose task went on in the background its final
-     *  status, once the task ends (see `Session.backgroundTerminals` and
-     *  `Session.backgroundToolCalls`). */
-    const endBackgroundTask = async (taskId: string, end: BackgroundTaskEnd) => {
-      const exit = takeBackgroundTerminalExit(session, params.sessionId, taskId);
-      if (exit) await sendUpdate(exit);
-      const toolCallEnd = takeBackgroundToolCallEnd(session, params.sessionId, taskId, end);
-      if (toolCallEnd) await sendUpdate(toolCallEnd);
-    };
+    /** Ends the terminal and the tool call of a task that ran in the
+     *  background, once the task ends (see `Session.background`). */
+    const endBackgroundTask = (taskId: string, end: BackgroundTaskEnd) =>
+      session.background.taskEnded(taskId, end, sendUpdate);
 
     /** Settles a task. Its request may still be open, and an agent without a
      *  record no longer blocks the foreground work, so that is checked again. */
@@ -6101,7 +6061,9 @@ export class ClaudeAcpAgent {
         const pause = messageLoopYielder.maybeYield();
         if (pause) await pause;
         // The last message may have changed the background work, and its
-        // updates are sent, so the list follows them.
+        // updates are sent, so the list follows them. A task that needs a
+        // tool call of its own gets it first, so the list can name it.
+        for (const call of session.background.adoptTasks(session)) await sendUpdate(call);
         this.backgroundWork.sync(params.sessionId, session, this.foregroundState(params.sessionId));
         pendingNext ??= session.query
           .next()
@@ -6520,6 +6482,7 @@ export class ClaudeAcpAgent {
                 } else if (message.compact_result === "success") {
                   await compaction.finish(message.uuid, "completed");
                 } else if (message.compact_result === "failed") {
+                  session.idleCompaction?.noteCompactionFailed(message.compact_error);
                   await compaction.finish(
                     message.uuid,
                     failedCompactionStatus(message.compact_error),
@@ -6547,7 +6510,11 @@ export class ClaudeAcpAgent {
                 await compaction.finish(
                   message.uuid,
                   "completed",
-                  compactMetadata ? contextCompactionMetadataFromBoundary(compactMetadata) : {},
+                  compactMetadata
+                    ? contextCompactionMetadataFromBoundary(compactMetadata, {
+                        idleCompaction: session.idleCompaction?.isCompacting,
+                      })
+                    : {},
                   true,
                 );
                 const usedTokens = compactMetadata?.post_tokens ?? 0;
@@ -6620,8 +6587,6 @@ export class ClaudeAcpAgent {
                   !firstUnsettledQueuedTurn()
                 ) {
                   await asyncTasks.autonomousTurnStarted();
-                } else if (message.state === "idle" && asyncTasks.autonomousTurnOpen) {
-                  await asyncTasks.autonomousTurnEnded("completed");
                 }
                 if (
                   message.state === "running" &&
@@ -6653,6 +6618,9 @@ export class ClaudeAcpAgent {
                   // here. An owed idle belongs to an earlier result: it can lag
                   // past the cycle's first output.
                   if (session.owedTrailingIdles === 0) {
+                    if (asyncTasks.autonomousTurnOpen) {
+                      await asyncTasks.autonomousTurnEnded("completed");
+                    }
                     await closeCycleToolCalls();
                     this.endAutonomousCycle(params.sessionId, {
                       outcome: { stopReason: session.cancelled ? "cancelled" : "end_turn" },
@@ -6786,6 +6754,10 @@ export class ClaudeAcpAgent {
                   // generatable; see SessionTitles.onTurnEnd.
                   await session.titles.onTurnEnd(session);
                 }
+                // After the settle block above: steered turns, held turns and
+                // autonomous cycles count as work until it settles them, and no
+                // further idle arrives to arm the timer.
+                if (message.state === "idle") session.idleCompaction?.onIdle();
                 break;
               }
               case "memory_recall": {
@@ -6827,6 +6799,16 @@ export class ClaudeAcpAgent {
                 // resume. Log it and surface a warning in the conversation.
                 this.logger.error(
                   `Session ${message.session_id}: failed to persist history: ${message.error}`,
+                );
+                break;
+              }
+              case "session_writes_lost": {
+                // A full disk (ENOSPC) or used-up quota (EDQUOT) kept the CLI
+                // from saving transcript lines or ~/.claude.json. The CLI sends
+                // it as it exits, after the last result, so no turn is open to
+                // carry a session/update: log it like `mirror_error`.
+                this.logger.error(
+                  `Session ${message.session_id}: Claude Code could not save ${message.lost.join(" and ")} (${message.error_code}); resuming may miss part of the conversation`,
                 );
                 break;
               }
@@ -6911,10 +6893,11 @@ export class ClaudeAcpAgent {
                   }
                 }
                 const severity = message.level === "warning" ? "warning" : "info";
+                const transcriptContent = collapseHookSpeaker(message.content);
                 const transcriptText =
                   message.level === "info"
-                    ? message.content
-                    : `**${sentenceCase(message.level)}:** ${message.content}`;
+                    ? transcriptContent
+                    : `**${sentenceCase(message.level)}:** ${transcriptContent}`;
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: noticeOrTranscriptUpdate(
@@ -6943,13 +6926,22 @@ export class ClaudeAcpAgent {
               case "hook_response":
               case "files_persisted":
                 break;
-              case "task_progress":
+              case "task_progress": {
                 if (isLateTaskRun(session, message.task_id, message.run_id)) {
                   this.logger.log(
                     `Ignoring task_progress for task ${message.task_id} from earlier run ${message.run_id}`,
                   );
                   break;
                 }
+                // The SDK does not type `workflow_progress`; see workflow-progress.ts.
+                const workflow = workflowSnapshot(
+                  (message as { workflow_progress?: unknown }).workflow_progress,
+                );
+                const progress = session.background.taskProgress(message.task_id, {
+                  ...taskProgressFields(message),
+                  ...(workflow ? { workflow } : {}),
+                });
+                if (progress) await sendUpdate(progress);
                 await asyncTasks.taskProgress({
                   task_id: message.task_id,
                   description: message.description,
@@ -6959,6 +6951,7 @@ export class ClaudeAcpAgent {
                   tool_use_id: message.tool_use_id,
                 });
                 break;
+              }
               case "task_started":
                 if (isLateTaskRun(session, message.task_id, message.run_id)) {
                   this.logger.log(
@@ -7097,23 +7090,13 @@ export class ClaudeAcpAgent {
                   }
                   settleLiveTask(message.task_id);
                 } else if (message.patch.status === "paused") {
-                  const pause = backgroundToolCallPause(
-                    session,
-                    params.sessionId,
-                    message.task_id,
-                    true,
-                  );
+                  const pause = session.background.taskPaused(message.task_id, true);
                   if (pause) await sendUpdate(pause);
                 } else if (
                   message.patch.status === "running" ||
                   message.patch.status === "pending"
                 ) {
-                  const resume = backgroundToolCallPause(
-                    session,
-                    params.sessionId,
-                    message.task_id,
-                    false,
-                  );
+                  const resume = session.background.taskPaused(message.task_id, false);
                   if (resume) await sendUpdate(resume);
                   // The SDK can resume a finished subagent under the same
                   // agent id without a new task_started.
@@ -7284,13 +7267,7 @@ export class ClaudeAcpAgent {
                 break;
               case "background_tasks_changed": {
                 await asyncTasks.backgroundTasksChanged(message.tasks);
-                if (session.reportsBackground) {
-                  const level = backgroundLevel(message.tasks);
-                  for (const taskId of droppedTasks(session, level)) {
-                    await endBackgroundTask(taskId, undefined);
-                  }
-                  session.backgroundLevel = level;
-                }
+                await session.background.levelChanged(message.tasks, sendUpdate);
                 // A level signal: the full live background-task set on every
                 // membership change, with REPLACE semantics. Used only to
                 // reconcile `liveBackgroundTasks` — dropping (or, for
@@ -8184,6 +8161,15 @@ export class ClaudeAcpAgent {
                 const model = message.event.message.model;
                 if (model && model !== "<synthetic>") {
                   lastAssistantModel = model;
+                  // `message_start` arrives with the first streamed token, close to
+                  // when the provider wrote the cache. The `assistant` message
+                  // below covers a response that was not streamed (the CLI's
+                  // non-streaming fallback); its shared id keeps the per-block
+                  // messages from moving the time.
+                  session.idleCompaction?.noteRequest(
+                    message.event.message.usage,
+                    message.event.message.id || undefined,
+                  );
                   // Only upgrade from the heuristic default — once we have an
                   // authoritative window (cache-seeded at session creation or
                   // on a model switch, read from the resumed session on
@@ -8558,6 +8544,10 @@ export class ClaudeAcpAgent {
                 lastAssistantUsage = snapshotFromUsage(message.message.usage);
                 lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
                 session.contextUsedTokens = lastAssistantTotalUsage;
+                session.idleCompaction?.noteRequest(
+                  message.message.usage,
+                  message.message.id || undefined,
+                );
               }
               lastAssistantWasUsageLimit = isSyntheticUsageLimitMessage(message.message);
               if (message.error || lastAssistantWasUsageLimit) {
@@ -8730,6 +8720,7 @@ export class ClaudeAcpAgent {
             const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
             let backgroundedToolCalls: ReadonlySet<string> = new Set();
             let runningTerminal: string | undefined;
+            let runningTerminalTask: string | undefined;
             let runningToolCalls: ReadonlySet<string> = new Set();
             if (message.type === "user") {
               rememberResolvedToolNames(session, content);
@@ -8743,6 +8734,18 @@ export class ClaudeAcpAgent {
                 content,
                 toolUseResult,
                 session.toolUseCache,
+                (toolUseId) => {
+                  for (const [taskId, task] of session.liveBackgroundTasks) {
+                    if (
+                      task.parentToolUseId === toolUseId &&
+                      task.taskType === "local_bash" &&
+                      task.backgrounded
+                    ) {
+                      return taskId;
+                    }
+                  }
+                  return undefined;
+                },
               );
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
               // The command's terminal runs until its task ends, unless the
@@ -8756,14 +8759,18 @@ export class ClaudeAcpAgent {
                 session.liveBackgroundTasks.has(backgroundBashTask.taskId)
               ) {
                 runningTerminal = terminalId;
-                (session.backgroundTerminals ??= new Map()).set(backgroundBashTask.taskId, {
+                session.background.terminalStarted(backgroundBashTask.taskId, {
                   toolCallId: terminalId,
                   ...(message.parent_tool_use_id
                     ? { parentToolUseId: message.parent_tool_use_id }
                     : {}),
+                  ...(typeof backgroundBashTask.outputFilePath === "string"
+                    ? { outputFilePath: backgroundBashTask.outputFilePath }
+                    : {}),
                 });
+                runningTerminalTask = backgroundBashTask.taskId;
               }
-              runningToolCalls = registerBackgroundToolCalls(
+              runningToolCalls = session.background.toolResults(
                 session,
                 content,
                 toolUseResult,
@@ -8847,6 +8854,21 @@ export class ClaudeAcpAgent {
                 ),
               );
             }
+            for (const progress of session.background.toolCallProgress(runningToolCalls)) {
+              await sendUpdate(progress);
+            }
+            // After the result's own updates: the command's output replaces
+            // the placeholder that they gave its terminal.
+            if (runningTerminalTask) {
+              session.background.followOutput(runningTerminalTask, (notification) =>
+                sendUpdate(notification).catch((error) => {
+                  this.logger.error(
+                    `Session ${params.sessionId}: failed to send background command output:`,
+                    error,
+                  );
+                }),
+              );
+            }
             break;
           }
           case "tool_progress": {
@@ -8902,7 +8924,12 @@ export class ClaudeAcpAgent {
             break;
           }
           case "rate_limit_event": {
-            if (lastAssistantTotalUsage !== null) {
+            session.idleCompaction?.noteRateLimit(message.rate_limit_info);
+            // With partial messages on, the SDK sends this before the turn's
+            // first assistant frame, while there is no usage yet to send it with.
+            if (lastAssistantTotalUsage === null) {
+              pendingRateLimit = message.rate_limit_info;
+            } else {
               await sendUpdate({
                 sessionId: params.sessionId,
                 update: attachUsageModel({
@@ -8928,7 +8955,13 @@ export class ClaudeAcpAgent {
             session.toolCallFields?.clear();
             clearHookCallbacks(params.sessionId);
             session.taskState.clear();
-            await this.publishTaskPlan(params.sessionId, session.taskState);
+            forgetPublishedTaskPlan(session.taskState);
+            for (const update of resetPlanUpdates(
+              this.clientCapabilities?.plan != null,
+              this.toolCallCapabilities.air.client,
+            )) {
+              await this.client.sessionUpdate({ sessionId: params.sessionId, update });
+            }
             // A reset mounts a fresh transcript (`new_conversation_id`), so our
             // cached title no longer describes the session: drop it and
             // re-evaluate at the next turn-end.
@@ -8936,6 +8969,8 @@ export class ClaudeAcpAgent {
             // The follow-up prompt was predicted from the transcript the reset
             // dropped, so it no longer follows from anything.
             await this.publishPromptSuggestion(params.sessionId, null);
+            // The recorded request and TTL describe the dropped conversation.
+            session.idleCompaction?.reset();
             break;
           }
           case "tool_use_summary":
@@ -9172,6 +9207,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    session.idleCompaction?.disarm("cancel");
     // Only prompts received before this cancel are cancelled. A prompt that
     // arrives while the awaits below run is queued and runs after the cancel
     // (ACP v2: a `session/prompt` received after `session/cancel` is not
@@ -9563,7 +9599,7 @@ export class ClaudeAcpAgent {
       // Its list row now shows what the registry and the transcript tell.
       this.sessionIndex.onOwnSessionChanged(sessionId);
       // Its background tasks end with the query's process.
-      for (const exit of endBackgroundWork(session, sessionId)) {
+      for (const exit of session.background.queryClosed()) {
         this.client.sessionUpdate(exit).catch((error) => {
           this.logger.error(`Session ${sessionId}: failed to end a background terminal:`, error);
         });
@@ -9572,6 +9608,7 @@ export class ClaudeAcpAgent {
     }
     session.consumer = undefined;
     session.contextCompaction = undefined;
+    session.idleCompaction?.dispose();
     session.settingsManager.dispose();
     session.input.end();
     session.query.close();
@@ -9674,7 +9711,7 @@ export class ClaudeAcpAgent {
   /** Stops a command running in the background (v2 `terminal/cancel`, see
    *  {@link cancelBackgroundWork}). */
   cancelBackgroundTerminal(params: { sessionId: string; terminalId: string }): Promise<void> {
-    return cancelBackgroundWork(this.sessions, params.sessionId, {
+    return cancelBackgroundWork(Object.values(this.sessions), params.sessionId, {
       terminalId: params.terminalId,
     });
   }
@@ -9682,7 +9719,7 @@ export class ClaudeAcpAgent {
   /** Stops the task of a tool call running in the background (v2
    *  `tool_call/cancel`, see {@link cancelBackgroundWork}). */
   cancelBackgroundToolCall(params: { sessionId: string; toolCallId: string }): Promise<void> {
-    return cancelBackgroundWork(this.sessions, params.sessionId, {
+    return cancelBackgroundWork(Object.values(this.sessions), params.sessionId, {
       toolCallId: params.toolCallId,
     });
   }
@@ -9697,7 +9734,7 @@ export class ClaudeAcpAgent {
     if (!session) return;
     const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
     try {
-      for (const update of backgroundToolCallStates(session, sessionId, toolCallIds, renderer)) {
+      for (const update of session.background.toolCallStates(toolCallIds, renderer, session.cwd)) {
         await this.client.sessionUpdate(update);
       }
     } catch (error) {
@@ -10247,9 +10284,10 @@ export class ClaudeAcpAgent {
       // The entity is keyed by the summary message's uuid, which differs from
       // the live id (the `compacting` status uuid) — replay is terminal-first
       // by the RFD, and no client merges a replay into a live entity store.
-      // A subagent's own compaction summary is not the root session's, and a
-      // summary whose framing is unrecognized stays visible as transcript
-      // text rather than vanishing behind a summary-less entity.
+      // A subagent's own compaction summary is not the root session's. A summary
+      // whose framing is unrecognized is still this compaction, without summary
+      // text: isCompactSummary says what it is, and the framing is Claude Code's
+      // to change.
       if (
         replayCompactionUpdates &&
         isCompactSummaryMessage(message) &&
@@ -10265,10 +10303,9 @@ export class ClaudeAcpAgent {
             airClient: this.toolCallCapabilities.air.client,
           },
         );
-        if (replayCompaction.recordSummary(assistantMessageText(message.message))) {
-          await replayCompaction.finish(message.uuid, "completed");
-          return;
-        }
+        replayCompaction.recordSummary(assistantMessageText(message.message));
+        await replayCompaction.finish(message.uuid, "completed");
+        return;
       }
 
       for (const notification of toAcpNotifications(
@@ -10486,6 +10523,15 @@ export class ClaudeAcpAgent {
     work.awaitingUser = waiting;
     if (waiting) work.events.awaitingUser();
     else if (!withdrawnByCancel) work.events.running();
+  }
+
+  /** Whether Claude is working in the session `sessionId`: an unsettled turn in
+   *  its queue, or foreground work that no turn owns, such as a cycle that
+   *  Claude Code started on its own. */
+  private claudeIsWorking(sessionId: string, session: Session): boolean {
+    return (
+      this.foregroundWork.has(sessionId) || (session.turnQueue ?? []).some((turn) => !turn.settled)
+    );
   }
 
   /** Sends the current title and `updatedAt` of the session `sessionId` as a
@@ -10963,15 +11009,13 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * The PreToolUse hook of a v2 connection, for Edit and Write: the tool call
-   * shows the exact patch of the change before the tool runs.
+   * Captures pre-execution patches for v2 Edit and Write tool calls.
    *
-   * A v2 diff cannot hold the input's snippet, so without it an auto-approved
-   * Edit or Write would show its change only once it is done. Claude Code runs
-   * the tool only after the hook returns, so the file is as it was before the
-   * change, as for the approval patch of a permission request (which runs
-   * after this hook, and shows the same patch). The hook makes no permission
-   * decision, and a failure only leaves the preview out.
+   * A v2 diff cannot hold the input's snippet, so the patch needs the file as
+   * it was before the tool runs. Claude Code waits for the hook before running
+   * the tool. If its streamed tool use has not arrived, the patch waits for
+   * the tool call's first publication. The hook makes no permission decision,
+   * and a failure only leaves the preview out.
    */
   private fileChangePreviewHook(sessionId: string): HookCallback {
     return async (input, toolUseID, { signal }) => {
@@ -10998,34 +11042,25 @@ export class ClaudeAcpAgent {
     const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
     const content = await previewPatchContent(input.tool_name, toolInput, session.cwd, "v2");
     if (!content) return;
+    const fields = toolCallFieldsOf(session);
+    // Workflow tools can run hooks without streaming their use or result.
+    // Keep the patch until the stream or a permission request publishes the
+    // tool call, instead of creating a pending call with no completion path.
+    if (!session.emittedToolCalls.has(toolUseID)) {
+      fields.stagePreview(toolUseID, content);
+      return;
+    }
     const { parentToolUseId, toolCallSessionId } = this.toolUseOwner(
       session,
       sessionId,
       input.agent_id,
     );
-    // Hook callbacks bypass the stream, so the hook can come before the
-    // streamed tool_use, as `canUseTool` can: then the tool call goes out
-    // with the patch.
-    if (!session.emittedToolCalls.has(toolUseID)) {
-      await this.ensureToolCallEmitted(
-        sessionId,
-        input.tool_name,
-        toolUseID,
-        toolInput,
-        parentToolUseId,
-        undefined,
-        toolCallSessionId,
-        content,
-      );
-      return;
-    }
     const update: SessionNotification["update"] = {
       sessionUpdate: "tool_call_update",
       toolCallId: toolUseID,
       content,
     };
     if (parentToolUseId) stampParentToolUseId(update, parentToolUseId);
-    const fields = toolCallFieldsOf(session);
     if (!fields.apply(update)) return;
     // The streamed input must not replace the patch, as for an approval patch.
     fields.pinContent(toolUseID, content);
@@ -11724,6 +11759,7 @@ export class ClaudeAcpAgent {
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
       const modelChanged = session.models.currentModelId !== value;
       if (modelChanged) {
+        session.idleCompaction?.disarm("model change");
         // Seed the new model's context window WITHOUT awaited IPC on the
         // switch path: cached authoritative value if we've already learned it
         // (from a prior turn's `result.modelUsage`), else the text heuristic,
@@ -12331,15 +12367,18 @@ export class ClaudeAcpAgent {
       settingsManager.getSettings().permissions?.disableBypassPermissionsMode !== "disable" &&
       sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions !== false;
 
-    const initialPermissionMode = resolveInitialPermissionMode(
-      {
-        explicit: creationOpts.permissionMode,
-        resumed: resumedPermissionMode,
-        defaultMode: settingsManager.getSettings().permissions?.defaultMode,
-      },
-      this.logger,
-      allowBypass,
-    );
+    const allowAuto = !autoModeDisabled(settingsManager.getSettings());
+
+    const { mode: initialPermissionMode, builtInDefault: builtInPermissionMode } =
+      resolveInitialPermissionMode(
+        {
+          explicit: creationOpts.permissionMode,
+          resumed: resumedPermissionMode,
+          defaultMode: settingsManager.getSettings().permissions?.defaultMode,
+        },
+        this.logger,
+        { allowBypass, allowAuto },
+      );
 
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
     const forwardSubagentText = this.forwardsSubagentText(params._meta);
@@ -12520,7 +12559,7 @@ export class ClaudeAcpAgent {
             supportedDialogKinds: [REFUSAL_FALLBACK_DIALOG_KIND],
           }
         : {}),
-      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
+      pathToClaudeCodeExecutable: await claudeCliPath(),
       extraArgs: {
         ...userProvidedOptions?.extraArgs,
         "replay-user-messages": "",
@@ -12545,9 +12584,9 @@ export class ClaudeAcpAgent {
               ],
             }
           : {}),
-        // On v2, an Edit or Write shows its exact patch before it runs, also
-        // when no permission request shows it (`fileChangePreviewHook`): a v2
-        // diff cannot hold the input's snippet.
+        // v2 needs the patch captured before an Edit or Write runs, also
+        // without a permission request (`fileChangePreviewHook`): a v2 diff
+        // cannot hold the input's snippet.
         ...(this.v2 || subagentConfigHook
           ? {
               PreToolUse: [
@@ -12746,14 +12785,21 @@ export class ClaudeAcpAgent {
       // configured. Managed `deniedModels` drops entries the CLI would refuse.
       const settingsAvailableModels = settingsManager.getSettings().availableModels;
       const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
+      const resumedModel = await resumedModelHint;
+      // A resumed Fable 5.2 session lists Fable 5.2 as `fable`, as a new
+      // session does (see `aliasResumedModelRow`).
+      const sdkModels = aliasResumedModelRow(
+        initializationResult.models,
+        creationOpts.resume !== undefined ? resumedModel : undefined,
+      );
       const settingsAllowedModels = Array.isArray(settingsAvailableModels)
         ? applyAvailableModelsAllowlist(
-            initializationResult.models,
+            sdkModels,
             settingsAvailableModels,
             settingsModelOverrides,
             settingsManager.getManagedDeniedModels(),
           )
-        : initializationResult.models;
+        : sdkModels;
       // Then keep only the models the `providers/set` gateway listed.
       const allowedModels = resolvedProvider?.listedModels
         ? narrowToGatewayModels(
@@ -12771,7 +12817,7 @@ export class ClaudeAcpAgent {
         this.logger,
         creationOpts.resume !== undefined,
         sessionId,
-        await resumedModelHint,
+        resumedModel,
         resolvedProvider?.listedModels !== undefined,
       );
       timing.phase("models");
@@ -12787,7 +12833,7 @@ export class ClaudeAcpAgent {
       const allowlistedModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
       const fallbackModelInfo = allowlistedModelInfo
         ? undefined
-        : (resolveModelPreference(initializationResult.models, models.currentModelId) ?? undefined);
+        : (resolveModelPreference(sdkModels, models.currentModelId) ?? undefined);
       const currentModelInfo = allowlistedModelInfo ?? fallbackModelInfo;
       // Register the fallback-resolved capabilities under the verbatim live id
       // so every modelInfos consumer (buildConfigOptions' effort lookup, later
@@ -12815,9 +12861,11 @@ export class ClaudeAcpAgent {
       const { modes, autoModeFallbackWarningPending } = await this.sessionModes.initialize({
         query: q,
         requestedMode: initialPermissionMode,
+        builtInDefault: builtInPermissionMode,
         currentModelInfo,
         currentModelId: models.currentModelId,
         allowBypass,
+        allowAuto,
       });
       timing.phase("modes");
 
@@ -12978,7 +13026,10 @@ export class ClaudeAcpAgent {
         emittedToolCalls: new Set(),
         eagerToolCallSessions: new Map(),
         liveBackgroundTasks: new Map(),
-        reportsBackground: this.backgroundWork.enabled && options.perTaskStopAffordance === true,
+        background: new SessionBackgroundWork(
+          sessionId,
+          this.backgroundWork.enabled && options.perTaskStopAffordance === true,
+        ),
         stopsWorkflowsOnCancel:
           options.perTaskStopAffordance === true &&
           !this.backgroundWork.enabled &&
@@ -12998,6 +13049,27 @@ export class ClaudeAcpAgent {
         )?.kind,
         fileChangeReporter,
       };
+      const registered = this.sessions[sessionId];
+      registered.idleCompaction = new IdleCompaction(
+        {
+          // `openUserInputs` also covers permission requests: `requestPermission`
+          // is wrapped in `withPendingUserInput`.
+          isBusy: () =>
+            this.claudeIsWorking(sessionId, registered) ||
+            (registered.openUserInputs?.size ?? 0) > 0,
+          contextTokens: () => registered.contextUsedTokens,
+          settings: () => registered.settingsManager.getSettings(),
+          compact: () =>
+            this.prompt(
+              { sessionId, prompt: [{ type: "text", text: "/compact" }] },
+              "idleCompaction",
+            ),
+          // The logger has no debug level.
+          log: (message) => this.logger.log(message),
+        },
+        // The CLI's own environment: process env, the client's and the provider's.
+        { env },
+      );
       timing.phase("register");
       this.backgroundWork.sync(
         sessionId,
@@ -14554,10 +14626,10 @@ export function toAcpNotifications(
         if (chunk.name === "TodoWrite") {
           // @ts-expect-error - sometimes input is empty object or undefined
           if (Array.isArray(chunk.input?.todos)) {
-            update = {
-              sessionUpdate: "plan",
-              entries: planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
-            };
+            update = checklistPlanUpdate(
+              planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
+              options?.clientCapabilities?.plan != null,
+            );
           }
         } else if (isTaskTool(chunk.name)) {
           // Task* tool_use is suppressed; the plan update is emitted at
@@ -14792,7 +14864,9 @@ export function toAcpNotifications(
           const entries = shouldEmitTaskPlan
             ? changedTaskPlanEntries(taskState, renderer.capabilities.air.client)
             : undefined;
-          if (entries) update = { sessionUpdate: "plan", entries };
+          if (entries) {
+            update = checklistPlanUpdate(entries, options?.clientCapabilities?.plan != null);
+          }
         } else if (toolUse.name !== "TodoWrite") {
           // A command sends its output first, then the exit and the status.
           const [finalUpdate, ...rest] = renderer

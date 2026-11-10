@@ -221,7 +221,10 @@ describe("AsyncTaskRuntime", () => {
     expect(published[1]?.update).not.toHaveProperty("summary");
     expect(published.at(-1)?.update).toMatchObject({
       sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "**Task stopped by user:** Build generated assets." },
+      content: {
+        type: "text",
+        text: "\n\n> **Task stopped by user:** Build generated assets.\n\n",
+      },
     });
   });
 
@@ -287,7 +290,7 @@ describe("AsyncTaskRuntime", () => {
     ]);
     expect(published.at(-1)?.update).toMatchObject({
       sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "**Task stopped by user:** npm run build." },
+      content: { type: "text", text: "\n\n> **Task stopped by user:** npm run build.\n\n" },
     });
   });
 
@@ -317,7 +320,7 @@ describe("AsyncTaskRuntime", () => {
     });
     expect(published.at(-1)?.update).toMatchObject({
       sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "**Task stopped by user:** npm run build." },
+      content: { type: "text", text: "\n\n> **Task stopped by user:** npm run build.\n\n" },
     });
   });
 
