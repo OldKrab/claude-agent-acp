@@ -5,7 +5,8 @@ export type IdleCompactionHost = {
   isBusy(): boolean;
   /** Context size after the last main-thread request, or undefined if unknown. */
   contextTokens(): number | undefined;
-  /** Current merged Claude Code settings. */
+  /** Current Claude Code settings, the client's `settings` option included
+   *  (`SettingsManager.getCompactionSettings`). */
   settings(): {
     idleCompaction?: boolean;
     autoCompactEnabled?: boolean;
@@ -83,7 +84,7 @@ export class IdleCompaction {
     this.setTimer = options.setTimeout ?? ((cb, ms) => setTimeout(cb, ms));
   }
 
-  /** Whether an idle compaction it started is still running. `acp-agent.ts` reports
+  /** Whether an idle compaction it started is still running. `v1/acp-agent.ts` reports
    *  `trigger: "idle"` while it is true. A client's `/compact` queued behind is read
    *  only after the adapter's turn's `result`, which clears `compacting`; this relies
    *  on the CLI emitting that compaction's `compact_boundary` after the previous

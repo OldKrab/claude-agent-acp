@@ -1,6 +1,6 @@
 import type { Query, SDKControlGetUsageResponse } from "@anthropic-ai/claude-agent-sdk";
 import { parseUsageResponse } from "./usage-markdown.js";
-import type { Logger } from "./acp-agent.js";
+import type { Logger } from "./logger.js";
 import { raceTimeoutAndAbort } from "./utils.js";
 
 /** Notification that pushes {@link AccountLimits} to the client. The limits

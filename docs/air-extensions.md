@@ -78,7 +78,7 @@ A page with more sessions after it has a `nextCursor`, as ACP defines.
 A client that does not follow `nextCursor` sees only the newest 1000 sessions of the directory.
 An unknown cursor gives an `invalidParams` error.
 
-`src/tests/acp-scenarios.test.ts` compares the traffic of a plain client and of Zed with recordings of origin/main.
+`src/tests/v1/acp-scenarios.test.ts` compares the traffic of a plain client and of Zed with recordings of origin/main.
 
 ## Negotiation
 
@@ -144,6 +144,15 @@ The `initialize` response of an AIR client carries the agent side of the extensi
 The agent list does not depend on the capabilities that AIR declares, except `sessionIndex`: the agent lists it, together with `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`, only for a client that declared `sessionIndex`.
 An extension is active only when the client declared its capability. The client does not declare `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`.
 The response to a client that is not AIR has no `_meta.jetbrains` key.
+
+### ACP v2
+
+The v2 core (`src/v2/`) serves an AIR client only the extensions that ACP v2 does not cover.
+Its `initialize` response lists `agentFileChangeReport` and `recommendedValue`.
+It also serves the [permission presentation](#permission-presentation), the [question custom answers](#question-custom-answers), the [predicted follow-up prompt](#predicted-follow-up-prompt), and [load replay end](#load-replay-end).
+The [agent file-change report](#agent-file-change-report) goes out at the end of the turn that serves the prompt, before the turn's idle `state_update`, because a v2 `session/prompt` is answered when Claude Code takes the prompt in.
+ACP v2 covers subagents, background work, plans, patches, compaction, the system prompt, and turn failures itself, so the v2 core serves no `nativeSubagentSessions`, `backgroundSubagents`, `asyncTasks`, `planFile`, `diffPatch`, `contextCompaction`, `customInstructions`, or `sessionFailure`.
+It does not serve the [tool call contract](#tool-call-contract) yet.
 
 ### Capabilities
 
@@ -219,7 +228,7 @@ The adapter keeps them where they are.
 
 ## Auth source display
 
-The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
+The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports the same identity through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`), with `kind`, `detail` and `plan` under the account's `_meta.claudeCode`. The account's `description` carries the `detail` too, e.g. `label: "Anthropic API key"` with `description: "ANTHROPIC_API_KEY"`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
 
 A command containing the whole word `central` and the word sequence `proxy start` is displayed as:
 
@@ -230,6 +239,8 @@ A command containing the whole word `central` and the word sequence `proxy start
 Matching is case-insensitive and accepts multiple whitespace characters between `proxy` and `start`. The command's flags, URL, host and route are not checked. This is a weak display heuristic, not proof of configuration provenance, account ownership or entitlement. Inactive helpers and external cloud backends retain their existing classification. No helper command, key, headers, private route or inferred account is included in this payload.
 
 Other active helpers use `label: "Anthropic API key"` and `detail: "API key helper"`; unknown key-source identifiers are not exposed as display text. CLI and SDK reads share this presentation, retain stale-probe protection, and suppress unchanged notifications.
+
+For Max subscriptions, the existing `claude auth status --json` probe's optional `planTier` distinguishes `max_20x` (displayed as `Claude Ultra`) from `max_5x` (`Claude Max`). Missing, unrecognized, or malformed tiers fall back to the subscription's usual label. Other subscriptions and auth sources keep their existing classification. The raw `account.plan` and ACP `_meta.claudeCode.plan` remain unchanged. SDK account reads lack the tier, so they preserve the known label for the same account and plan; a fresh CLI read replaces it, including when the tier is absent. This is display metadata, not an entitlement check, and requires no additional probe or direct credential-file reads.
 
 ## Zed conventions
 
@@ -548,7 +559,7 @@ AIR puts the hooks into `_meta.claudeCode.options.settings.hooks` of `session/ne
 ```
 
 - The settings go to the flag settings tier of that session only. Other sessions and the settings files do not change.
-- Claude Code runs the hooks of every settings tier, so the user, project and IDE hooks of one event all run. `src/tests/session-hooks.test.ts` checks this with the Claude Code binary.
+- Claude Code runs the hooks of every settings tier, so the user, project and IDE hooks of one event all run. `src/tests/v1/session-hooks.test.ts` checks this with the Claude Code binary.
 - `CLAUDE_MODEL_CONFIG` stays in effect (see [Model configuration](model-configuration.md#precedence)).
 - A `session/load` with different settings recreates the query, so it applies the new hooks.
 - Claude asks for no hook trust step.
@@ -690,7 +701,7 @@ When `matchedAskRule` is present, the adapter offers no persistent choice. A con
 | WebFetch                  | One-time allow; a generated `domain:<hostname>` local rule; reject.                                                          |
 | Skill                     | One-time allow; exact skill and optional `prefix:*` local rules; reject.                                                     |
 | EnterPlanMode             | Enter plan mode once, or reject and continue.                                                                                |
-| ExitPlanMode              | One keep-context and one clear-context elevated mode (`auto` before bypass before accept edits), manual approval, or reject. |
+| ExitPlanMode              | One keep-context elevated mode, one clear-context mode (with `showClearContextOnPlanAccept` on), manual approval, or reject. |
 | SandboxNetworkAccess      | One-time allow; the exact SDK host rule when representable; reject.                                                          |
 | Computer Use MCP          | One-time allow; an exact representable SDK allow suggestion; reject.                                                         |
 | MCP                       | One-time allow; an exact representable SDK allow suggestion for that tool; reject.                                           |
@@ -715,7 +726,9 @@ A host removes `Bypass permissions` with `_meta.claudeCode.options.allowDangerou
 A `bypassPermissions` settings default then falls back to `default`.
 
 `ExitPlanMode` offers one elevated keep-context choice by priority: `auto`, then `bypassPermissions`, then `acceptEdits`.
-A non-empty plan also gets one clear-context choice with the same priority.
+When Claude Code's `showClearContextOnPlanAccept` setting is on, a non-empty plan also gets one clear-context choice with the same priority.
+The setting is off by default, as in Claude Code.
+The adapter reads it as Claude Code does: managed settings first, then the `settings` option of the session, then the user, project, and local settings files.
 After that choice, the adapter stops the old private Claude query and hides that internal rejection.
 It starts a new private query under the same ACP session.
 It continues the turn with `Implement the following plan:` and the complete plan.
@@ -846,8 +859,9 @@ A failed command restores the previous state.
 
 After a turn, the Claude Code CLI can predict the prompt the user is likely to send next.
 The adapter asks for it with the SDK option `promptSuggestions: true` and forwards the one prediction of the turn.
+It asks only in a session of AIR or of a client that advertises `session.promptSuggestions`, on v1 and v2: a prediction costs a request per turn, and no other client would get it.
 
-ACP has no field for a composer prefill, so the prediction travels outside the AIR namespace:
+AIR reads the prediction from a `_meta` key outside the AIR namespace, which the adapter used before ACP had an update for it:
 
 ```json
 {
@@ -856,8 +870,19 @@ ACP has no field for a composer prefill, so the prediction travels outside the A
 }
 ```
 
-The key names no vendor, so another client can read it.
+The key names no vendor.
 The adapter sends it only to an AIR client; see the [compatibility rule](#compatibility-rule).
+
+Any client that advertises `session.promptSuggestions` gets the same prediction as ACP's unstable `prompt_suggestions_update`, on v1 and v2:
+
+```json
+{
+  "sessionUpdate": "prompt_suggestions_update",
+  "suggestions": [{ "prompt": [{ "type": "text", "text": "Run the tests" }] }]
+}
+```
+
+An AIR client that advertises the capability gets both.
 
 AIR shows the first non-blank `suggestions[].text` as gray text in an empty composer.
 Tab fills the composer with it and sends nothing.
@@ -868,6 +893,11 @@ Tab fills the composer with it and sends nothing.
 - on a `conversation_reset`, because the prediction was drawn from the transcript the reset dropped.
 
 A prediction the next prompt outran — the user sent it before the adapter read the prediction off the SDK stream — is dropped instead of published.
+
+`prompt_suggestions_update` follows two more rules of ACP, which the `_meta` form does not:
+
+- a prediction that arrives while Claude works, such as on a prompt that was queued before the turn's result, is dropped;
+- on v2, the list is withdrawn when foreground work starts without a prompt, such as a cycle that Claude Code starts after a background task ends.
 
 The CLI predicts nothing on the first turn of a session, after an API error, in plan mode, and at the account's usage limit, so many turns end with no prediction.
 A client must treat a turn without one as normal.
@@ -1071,7 +1101,8 @@ The adapter ignores a malformed request and a repeated request id.
 
 ### Report
 
-The adapter sends one `session_info_update` before the `PromptResponse`:
+The adapter sends one `session_info_update` before the `PromptResponse`.
+On ACP v2 it comes before the idle `state_update` of the turn that serves the prompt (see [ACP v2](#acp-v2)):
 
 ```json
 {
@@ -1415,6 +1446,8 @@ Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archiv
 
 `_session/rename { "sessionId": "…", "title": "…" }` returns `{}`.
 
+ACP's `session/set_title` renames the same way for every client, on v1 and v2, without `sessionIndex`, and returns `{ "title": "…" }`: the title as `session/list` shows it to the client. On v1 an AIR client gets it without the archive prefix, and every other client, and every v2 client, with it.
+
 - A blank title is `-32602`. The adapter collapses whitespace and keeps the first 200 characters, trimmed, as the CLI does. An `[archived] ` prefix of the requested title is dropped: a rename never changes the archive state.
 - The title is stored as the title records of [Archive](#archive): a `custom-title` and an `agent-name` record. An archived session keeps its `[archived] ` prefix (and the title is cut to 200 characters with it), so a rename does not unarchive it.
 - A session that runs here on a CLI without the `rename_session` control request is refused with `-32600`: its CLI holds the title and would write it back.
@@ -1648,7 +1681,7 @@ Claude Code sends the result of the turn when the main agent stops, also while s
 
 ### Hold without the capability
 
-A client that does not declare `backgroundSubagents` gets the hold of issues #864 and #866.
+A client that does not declare `backgroundSubagents` gets the hold of issues #864 and #866, also in the RFD form of [subagent sessions](subagent-sessions.md) (a fork divergence from upstream #1603).
 The adapter keeps the `session/prompt` request open while a subagent that the turn started or resumed runs.
 A Workflow that the turn started holds it the same way, because Claude Code sends no `idle` until a Workflow ends. A background command holds no turn.
 The subagent output, its permission requests and the followup summary of the model then go out inside the turn.
@@ -1658,7 +1691,8 @@ The hold protects a client that stops listening at the prompt response.
 ### Behavior with the capability
 
 AIR declares `backgroundSubagents` in `initialize.clientCapabilities._meta.jetbrains.air.capabilities`.
-The capability applies to ACP v1 only. ACP v2 keeps the hold, and the agent does not advertise the capability to ACP v2.
+The capability applies to ACP v1 only, and the agent does not advertise it to ACP v2.
+ACP v2 has no hold: the v2 agent answers `session/prompt` when Claude Code takes the prompt in, lists a background subagent in its parent session's `background` while it works, and reports each subagent's work in the state of its child session (see [ACP v2](#acp-v2)).
 
 - The turn ends at its result with the stop reason of the result, usually `end_turn`.
 - The subagent updates, permission requests and elicitations go out after the prompt response.
@@ -1677,7 +1711,7 @@ The request has no clear-context option, because the fresh query must continue a
 "No, keep planning" stops only the followup cycle. There is no turn to end.
 
 A prompt turn owns the request when the turn is active, or when Claude Code asks before the echo of its prompt.
-Then the request has the clear-context option.
+Then the request has the clear-context option, when `showClearContextOnPlanAccept` is on.
 A turn that took over a followup cycle also owns the request of that cycle, and the accepted plan continues in that turn.
 
 ## Context compaction
@@ -1737,8 +1771,9 @@ A client that is not AIR gets neither key.
 
 ## Load replay end
 
-ACP has no signal that the history replay of `session/load` is over, other than the response.
+ACP v1 has no signal that the history replay of `session/load` is over, other than the response.
 The adapter replays the transcript while the Claude Code CLI starts, so the history can arrive long before the response.
+ACP v2 has the `replay_complete` update for this, which the adapter sends to every v2 client.
 
 The client declares `loadReplayEnd` in its capabilities. The agent does not advertise it.
 After the history replay of the loaded session, the agent then sends one more update for that session:
@@ -1756,7 +1791,7 @@ After the history replay of the loaded session, the agent then sends one more up
 - The update has no `title` and no `updatedAt`. A `null` there would clear the value.
 - It comes after every replayed update, the subagent history that the replay sends to the child sessions included, and before the `session/load` response.
 - It comes also for an empty history.
-- It comes for `session/load` of a new or an already live session, and for the ACP v2 `session/resume` with `replayFrom: {type: "start"}`.
+- It comes for `session/load` of a new or an already live session, and for the ACP v2 `session/resume` with `replayFrom: {type: "start"}`. On v2 it comes right after the session's `replay_complete`, which marks the same point.
 - It does not come when the replay stops or fails. The replay stops when the CLI start fails during the replay.
 - It does not come for a live update, and it does not come to a client without the capability.
 - The `session/load` can still fail after it, for example when the CLI start fails after the replay. The event means that the recorded history arrived whole. The client decides what to do with the failed load.
