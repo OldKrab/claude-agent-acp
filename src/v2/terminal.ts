@@ -56,7 +56,15 @@ export class V2Terminals {
   ): { terminal: v2.SessionUpdate[]; report: V1ToolCallReport | undefined } {
     const meta = (report._meta ?? {}) as TerminalMeta;
     const key = `${sessionId} ${report.toolCallId}`;
-    if (meta.terminal_info) this.running.set(key, { terminalId: meta.terminal_info.terminal_id });
+    // A replay of a command that still runs, such as one in the background,
+    // names its terminal again: the running entry keeps its command and
+    // `cancellable`.
+    if (
+      meta.terminal_info &&
+      this.running.get(key)?.terminalId !== meta.terminal_info.terminal_id
+    ) {
+      this.running.set(key, { terminalId: meta.terminal_info.terminal_id });
+    }
     const terminal: v2.SessionUpdate[] = [];
     const running = this.running.get(key);
     if (running) {
@@ -69,7 +77,7 @@ export class V2Terminals {
           sessionUpdate: "terminal_update",
           terminalId: running.terminalId,
           ...(newCommand ? { command } : {}),
-          ...(output ? { output: { data: base64(output.data) } } : {}),
+          ...(output ? { output: { data: terminalBytes(output.data) } } : {}),
           ...(exit
             ? {
                 exitStatus: {
@@ -86,7 +94,7 @@ export class V2Terminals {
         terminal.push({
           sessionUpdate: "terminal_output_chunk",
           terminalId: running.terminalId,
-          data: base64(delta.data),
+          data: terminalBytes(delta.data),
         });
       }
       if (exit) this.running.delete(key);
@@ -153,7 +161,13 @@ function commandOf(rawInput: unknown): string | undefined {
   return typeof command === "string" && command.length > 0 ? command : undefined;
 }
 
-/** The output bytes, base64-encoded as a v2 terminal carries them. */
-function base64(text: string): string {
-  return Buffer.from(text, "utf8").toString("base64");
+/**
+ * The output as the bytes a PTY would have delivered, base64-encoded as a v2
+ * terminal carries them. A v2 terminal carries the bytes a terminal emulator
+ * receives, but Claude Code runs a command with its output piped, so no line
+ * discipline turned each LF into CR LF (`ONLCR`). Without the CR, an emulator
+ * moves down a row and keeps the column: "a\nb" draws "b" under the end of "a".
+ */
+function terminalBytes(text: string): string {
+  return Buffer.from(text.replaceAll("\n", "\r\n"), "utf8").toString("base64");
 }

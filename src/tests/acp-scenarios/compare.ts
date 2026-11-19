@@ -25,6 +25,23 @@
  * - The `initialize` response also advertises
  *   `agentCapabilities.sessionCapabilities.systemPrompt`, which origin/main
  *   did not: the agent now applies the `systemPrompt` of session requests.
+ * - The `initialize` response also advertises `agentCapabilities.auth.status`,
+ *   which origin/main did not: the agent now answers `auth/status` and sends
+ *   `auth/status_update`.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.sessionCapabilities.status`, which origin/main did
+ *   not: the agent now serves `session/status`.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.sessionCapabilities.title`, which origin/main did not:
+ *   the agent now serves `session/set_title`.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.sessionCapabilities.options`, which origin/main did
+ *   not: the agent now serves `session/options` and takes `configOptions` on
+ *   session setup requests.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.mcpCapabilities.acp`, which origin/main did not: the
+ *   agent now takes MCP servers that the client serves over the ACP
+ *   connection (`"type": "acp"`).
  * - A SandboxNetworkAccess tool call is settled by a `tool_call_update` with
  *   only its final `status` once its permission request is answered. The
  *   callback runs nothing, so origin/main never settled the call (see
@@ -237,19 +254,30 @@ function isMeta(key: string): boolean {
   return key.startsWith("_meta.");
 }
 
-/** `record` without the session capability `key`, when it is an `initialize` response. */
-function withoutSessionCapability(record: Recorded, key: string): Recorded {
+/** `record` without the session capabilities `keys`, when it is an `initialize` response. */
+function withoutSessionCapabilities(record: Recorded, keys: readonly string[]): Recorded {
   if (record.kind !== "initialize") return record;
   const payload = record.payload as Json;
   const agent = payload.agentCapabilities as Json | undefined;
   const session = agent?.sessionCapabilities as Json | undefined;
-  if (!session || !(key in session)) return record;
+  if (!session || !keys.some((key) => key in session)) return record;
+  const remaining = keys.reduce((rest, key) => without(rest, key), session);
   return {
     ...record,
-    payload: {
-      ...payload,
-      agentCapabilities: { ...agent, sessionCapabilities: without(session, key) },
-    },
+    payload: { ...payload, agentCapabilities: { ...agent, sessionCapabilities: remaining } },
+  } as Recorded;
+}
+
+/** `record` without `agentCapabilities.<group>.<key>`, when it is an `initialize` response. */
+function withoutAgentCapability(record: Recorded, group: string, key: string): Recorded {
+  if (record.kind !== "initialize") return record;
+  const payload = record.payload as Json;
+  const agent = payload.agentCapabilities as Json | undefined;
+  const capabilities = agent?.[group] as Json | undefined;
+  if (!capabilities || !(key in capabilities)) return record;
+  return {
+    ...record,
+    payload: { ...payload, agentCapabilities: { ...agent, [group]: without(capabilities, key) } },
   } as Recorded;
 }
 
@@ -259,14 +287,26 @@ function withoutSessionCapability(record: Recorded, key: string): Recorded {
  */
 export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): string[] {
   const expected = baseline
-    .map((record) => withoutSessionCapability(withoutAirOnlyKeys(record) as Recorded, "subagents"))
+    .map((record) =>
+      withoutSessionCapabilities(withoutAirOnlyKeys(record) as Recorded, ["subagents"]),
+    )
     .filter((record) => {
       const update = updateOf(record);
       return !(update?.sessionUpdate === "session_info_update" && Object.keys(update).length === 1);
     });
   const current = withoutSessionStateNotifications(
     withoutSandboxNetworkSettlements(
-      traffic.map((record) => withoutSessionCapability(record, "systemPrompt")),
+      traffic.map((record) =>
+        withoutAgentCapability(
+          withoutAgentCapability(
+            withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
+            "auth",
+            "status",
+          ),
+          "mcpCapabilities",
+          "acp",
+        ),
+      ),
     ),
   );
   const violations: string[] = [];
