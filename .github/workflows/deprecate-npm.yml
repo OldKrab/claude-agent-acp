@@ -1,0 +1,31 @@
+# One-time: marks every published version of the npm package deprecated, because
+# the fork no longer publishes to npm (OpenAIDE embeds it from git). Delete this
+# workflow after its single successful run.
+name: Deprecate npm package
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  deprecate:
+    name: Deprecate every published version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "lts/*"
+          registry-url: "https://registry.npmjs.org"
+
+      # `@*` matches every version, prereleases included.
+      - name: Deprecate
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE: "@openaide/claude-agent-acp"
+          MESSAGE: "No longer published. OpenAIDE embeds this adapter from https://github.com/OldKrab/claude-agent-acp; for other ACP clients use the upstream adapter."
+        run: |
+          npm deprecate "${PACKAGE}@*" "$MESSAGE"
+          npm view "$PACKAGE" deprecated
