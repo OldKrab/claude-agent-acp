@@ -1,7 +1,5 @@
 # ACP adapter for the Claude Agent SDK
 
-[![npm](https://img.shields.io/npm/v/%40openaide%2Fclaude-agent-acp)](https://www.npmjs.com/package/@openaide/claude-agent-acp)
-
 Use [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview#branding-guidelines) from [ACP-compatible](https://agentclientprotocol.com) clients!
 
 This tool implements an ACP agent by using the official [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview), supporting:
@@ -30,11 +28,16 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
 This is the OpenAIDE-maintained build of
-[`agentclientprotocol/claude-agent-acp`](https://github.com/agentclientprotocol/claude-agent-acp),
-published as `@openaide/claude-agent-acp` with its own version line:
+[`agentclientprotocol/claude-agent-acp`](https://github.com/agentclientprotocol/claude-agent-acp).
+It is not published to npm: OpenAIDE embeds it from this repository, and each
+merge to `main` that passes CI reaches OpenAIDE automatically (see
+[`docs/RELEASES.md`](docs/RELEASES.md)). Other ACP clients should use the upstream
+adapter. To run this build from a checkout:
 
 ```sh
-npx -y @openaide/claude-agent-acp
+npm ci
+npm run build
+node dist/index.js
 ```
 
 ### Standalone executables

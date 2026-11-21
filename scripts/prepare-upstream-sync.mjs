@@ -3,7 +3,10 @@ import { writeFileSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 
 const missing = Symbol("missing");
-// Release history and publishing belong to the fork, independently of upstream.
+// Files whose fork state, including absence, is kept as is: upstream's changes to
+// them are never applied. The fork's guide, release history and delivery docs are
+// its own, and it does not publish to npm, so upstream's release-please and
+// publishing files stay deleted here (OpenAIDE embeds the fork from git).
 const forkOwnedFiles = [
   "AGENTS.md",
   ".github/workflows/publish.yml",
@@ -13,7 +16,8 @@ const forkOwnedFiles = [
   "docs/RELEASES.md",
   "scripts/release-preflight.sh",
 ];
-const allowedConflicts = new Set([...forkOwnedFiles, "package-lock.json", "package.json"]);
+// Both are rewritten from the three-way JSON merge below.
+const allowedConflicts = new Set(["package-lock.json", "package.json"]);
 class SyncConflict extends Error {}
 const forkOwnedPackagePaths = new Set([
   "bugs",
@@ -113,10 +117,15 @@ function prepare() {
 
   git(["switch", "--create", branch]);
   // Apply upstream's changes since the base as a three-way patch. The result is one
-  // ordinary commit on top of the fork, matching how the PR is squash-merged.
-  const diff = execFileSync("git", ["diff", "--binary", "--full-index", mergeBase, release], {
-    maxBuffer: 1 << 30,
-  });
+  // ordinary commit on top of the fork, matching how the PR is squash-merged. A
+  // patch to a file the fork deleted cannot apply at all, so fork-owned files are
+  // left out of the patch rather than restored afterwards.
+  const excluded = forkOwnedFiles.map((file) => `:(exclude,literal)${file}`);
+  const diff = execFileSync(
+    "git",
+    ["diff", "--binary", "--full-index", mergeBase, release, "--", ".", ...excluded],
+    { maxBuffer: 1 << 30 },
+  );
   const merge = spawnSync("git", ["apply", "--3way", "--index", "--whitespace=nowarn"], {
     encoding: "utf8",
     input: diff,
@@ -134,13 +143,9 @@ function prepare() {
     }
   }
 
-  const ownedFiles = forkOwnedFiles.filter(
-    (file) => spawnSync("git", ["cat-file", "-e", `${forkHead}:${file}`]).status === 0,
-  );
-  git(["restore", "--source", forkHead, "--staged", "--worktree", "--", ...ownedFiles]);
   writeJson("package.json", mergedPackage);
   writeJson("package-lock.json", mergedLock);
-  git(["add", ...ownedFiles, "package.json", "package-lock.json"]);
+  git(["add", "package.json", "package-lock.json"]);
   const unresolved = git(["diff", "--name-only", "--diff-filter=U"]);
   if (unresolved) {
     abort();

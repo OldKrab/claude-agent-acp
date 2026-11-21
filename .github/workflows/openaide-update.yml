@@ -1,0 +1,73 @@
+# OpenAIDE embeds this fork from a git submodule pinned to a commit on `main`.
+# When CI passes on a push to `main`, ask OpenAIDE to move that submodule to the
+# tested commit; its update workflow regenerates the lockfile and opens a pull
+# request that merges itself on green CI. OpenAIDE's daily scheduled run of the
+# same workflow picks up the latest `main` if this dispatch is lost.
+name: OpenAIDE Update
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    name: Request the OpenAIDE submodule update
+    # Pull request runs from a branch that happens to be named `main` also match
+    # the branch filter; only a push to this repository's `main` is embedded.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # CI runs for two quick merges can finish out of order. Only the run for the
+      # current tip dispatches, so OpenAIDE never moves back to an older commit;
+      # the newer commit's own CI run dispatches it once it passes.
+      - name: Check that the tested commit is still the tip of main
+        id: tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          tip="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          if [[ "$tip" != "$COMMIT" ]]; then
+            echo "Skipping ${COMMIT}: main has moved to ${tip}, whose CI run dispatches the update" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The shared release App is also installed on OpenAIDE; scope the token to
+      # that repository and inherit the installation's permission policy, which
+      # must include `Actions: write` there.
+      - name: Generate token scoped to OpenAIDE
+        if: steps.tip.outputs.current == 'true'
+        id: openaide-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: OpenAIDE
+
+      - name: Dispatch the submodule update
+        if: steps.tip.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ steps.openaide-token.outputs.token }}
+          OPENAIDE_REPOSITORY: ${{ github.repository_owner }}/OpenAIDE
+          COMMIT: ${{ github.event.workflow_run.head_sha }}
+          CI_RUN: ${{ github.event.workflow_run.html_url }}
+        run: |
+          gh workflow run update-adapter.yml \
+            --repo "$OPENAIDE_REPOSITORY" \
+            --ref main \
+            -f adapter=claude-agent-acp \
+            -f commit="$COMMIT"
+          echo "Requested ${OPENAIDE_REPOSITORY} to embed claude-agent-acp@${COMMIT} after ${CI_RUN}" | tee -a "$GITHUB_STEP_SUMMARY"

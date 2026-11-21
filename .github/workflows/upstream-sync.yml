@@ -22,7 +22,7 @@ jobs:
     steps:
       - name: Generate repository token
         id: repository-token
-        # Match the other release workflows: the shared App installation owns
+        # Match the other workflows: the shared App installation owns
         # its permission policy, and rejects a separately narrowed token request.
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         with:
@@ -186,11 +186,11 @@ jobs:
           cat > "$body" <<EOF
           Tracks the exact [upstream ${TAG} release](https://github.com/${UPSTREAM_REPOSITORY}/releases/tag/${TAG}).
 
-          The daily sync prepares the immutable upstream release against current main, preserving the \`@openaide/claude-agent-acp\` package identity and fork-owned release files. Automation refreshes its own branch as main advances and stops rewriting it after maintainer commits.
+          The daily sync prepares the immutable upstream release against current main, preserving the \`@openaide/claude-agent-acp\` package identity and fork-owned files. Automation refreshes its own branch as main advances and stops rewriting it after maintainer commits.
 
-          A draft means source or dependency conflicts need manual resolution. Its branch may point at the raw upstream release: resolve the conflicts and preserve the fork package identity and release files before marking ready. A closed PR suppresses recreation for that tag. If a newer upstream release arrives before this PR merges, its update PR closes this one as superseded; a branch with maintainer commits is kept.
+          A draft means source or dependency conflicts need manual resolution. Its branch may point at the raw upstream release: resolve the conflicts and preserve the fork package identity and fork-owned files before marking ready. A closed PR suppresses recreation for that tag. If a newer upstream release arrives before this PR merges, its update PR closes this one as superseded; a branch with maintainer commits is kept.
 
-          The normal pull-request CI suite validates prepared merges. Review the release impact and use a release-triggering conventional title before merging when a package release is intended.
+          The normal pull-request CI suite validates prepared merges. Review the product impact before merging; once merged and green on main, the update reaches OpenAIDE automatically.
           EOF
 
           draft_args=()
